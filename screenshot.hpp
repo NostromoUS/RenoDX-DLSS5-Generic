@@ -9,12 +9,9 @@
 // present path never touches D3D12 objects, user32 (beyond the one hotkey
 // poll), std::filesystem, or the heap on behalf of this feature until the user
 // arms it. Concretely:
-//   - No QueryInterface and no command queue anywhere in this file.  GPU
-//     completion is proven with a fence-completed lease (gpu_lease.hpp)
-//     acquired once the capture frame has presented - a poll of
-//     ID3D12Fence::GetCompletedValue, never a CPU wait - with the
-//     present-generation delay (kSettlePresents) kept as the fallback for
-//     queues without a tracked fence.
+//   - No QueryInterface or queue calls here. Every copy joins a submission
+//     tracker proof, completed only after its recording cannot replay and
+//     its actual GPU submissions finished. Idle queues are irrelevant.
 //   - The render/evaluate thread only creates two addon-owned READBACK heap
 //     buffers (Prepare stage). No filesystem calls there either.
 //   - Readback mapping, RGBA conversion, PNG encoding, and file IO run on a
@@ -63,7 +60,7 @@
 
 #include "../../utils/path.hpp"
 #include "../../utils/png.hpp"
-#include "gpu_lease.hpp"
+#include "submission_tracker.hpp"
 
 namespace renodx::addons::dlss5::screenshot {
 enum class FileFormat : uint32_t { kPng = 0, kJpeg = 1, kPngAndJpeg = 2 };
@@ -74,11 +71,9 @@ inline std::atomic_uint32_t max_megabytes = 10;
 
 namespace internal {
 
-// Fallback for queues without a tracked completion fence: presents that must
-// pass after the copies were recorded before the readback buffers are
-// mapped. Matches the retire-settle window the resource-release path uses;
-// with fences the lease replaces this age rule.
-constexpr uint64_t kSettlePresents = 4;
+// Wall-clock delivery deadline, never evidence of GPU completion. Generated
+// presents used to exhaust the ten-tick deadline in 80 ms (FFXVI report).
+constexpr auto kCopyTimeout = std::chrono::seconds(5);
 // Presents an armed capture may wait without a single DLSS evaluation before
 // it disarms itself (~10 s at 60 fps).  Without this, F5 pressed during a
 // loading screen or with NR off fires much later on the first evaluate -
@@ -129,13 +124,9 @@ struct PendingCapture {
   uint64_t timestamp_ms = 0;  // filename stem components; paths are only built
   uint64_t serial = 0;        // on the worker so Prepare never touches the fs
   uint64_t creation_generation = 0;  // present_generation when recorded
-  // Acquired at the capture frame's present (all submits carrying the copies
-  // are queued by then); empty until then or when no queue fence exists.
-  // lease_generation stamps when the lease was taken so a fence that never
-  // advances (present-starved session) settles on the bounded fallback.
-  GpuLease lease;
-  uint64_t lease_generation = 0;
-  bool lease_taken = false;
+  std::shared_ptr<submission::ReadbackProof> proof =
+      std::make_shared<submission::ReadbackProof>();
+  std::chrono::steady_clock::time_point recorded_at = std::chrono::steady_clock::now();
   bool ready = false;                // both copies have been recorded
   bool aborted = false;
 };
@@ -152,6 +143,7 @@ inline std::atomic_uint32_t presents_while_armed = 0;
 inline std::mutex state_mutex;
 inline std::optional<PendingCapture> pending;
 inline std::atomic_bool has_pending = false;
+inline std::atomic_bool has_retired = false;
 
 struct FinishedCapture {
   uint64_t serial = 0;
@@ -177,8 +169,8 @@ inline void PublishFinished(FinishedCapture record) noexcept {
 
 // Buffers from evaluates that were superseded within the same capture-frame
 // (the capture re-records on every DLSS-family evaluate so the LAST one wins).
-// They share the frame's command list, so they are released at the same settle
-// window as the final capture rather than immediately.  This owns the ENTIRE
+// Each set retains its own recording/submission proof, including copies on
+// different lists. This owns the ENTIRE
 // superseded buffer set - the PNG pair AND every diagnostic plane: replacing
 // `pending` used to destroy the old planes vector without releasing its raw
 // COM readback pointers, leaking every re-recorded plane (a 4K FP16 plane is
@@ -187,6 +179,7 @@ struct RetiredCaptureBuffers {
   ID3D12Resource* pre_nr_readback = nullptr;
   ID3D12Resource* nr_output_readback = nullptr;
   std::vector<DiagnosticPlane> planes;
+  std::shared_ptr<submission::ReadbackProof> proof;
 
   void Release() {
     if (pre_nr_readback != nullptr) pre_nr_readback->Release();
@@ -197,15 +190,17 @@ struct RetiredCaptureBuffers {
     pre_nr_readback = nullptr;
     nr_output_readback = nullptr;
     planes.clear();
+    proof.reset();
   }
 
   // Takes ownership of a cancelled PendingCapture's raw buffers for
-  // retention (unproven GPU completion: release happens behind the next
-  // proven settle or at teardown, never on a timeout).
+  // retention until its own copies are no longer in flight or replayable.
+  // A timeout cannot release buffers with an unresolved proof.
   void Take(PendingCapture&& capture) {
     pre_nr_readback = capture.pre_nr_readback;
     nr_output_readback = capture.nr_output_readback;
     planes = std::move(capture.planes);
+    proof = std::move(capture.proof);
     capture.pre_nr_readback = nullptr;
     capture.nr_output_readback = nullptr;
     capture.planes.clear();
@@ -1169,13 +1164,12 @@ inline bool PrepareCapture(
     // A prior evaluate in this same capture-frame already recorded a pair into
     // its own buffers. Retire that ENTIRE buffer set - the PNG pair and every
     // diagnostic plane (still GPU-pending on the frame's command list) - so it
-    // is released at the same settle window as the final capture; the latest
+    // is released after its own submission proof completes; the latest
     // evaluate's pair wins.
     internal::RetiredCaptureBuffers retired;
-    retired.pre_nr_readback = internal::pending->pre_nr_readback;
-    retired.nr_output_readback = internal::pending->nr_output_readback;
-    retired.planes = std::move(internal::pending->planes);
+    retired.Take(std::move(*internal::pending));
     internal::retired_buffers.push_back(std::move(retired));
+    internal::has_retired.store(true, std::memory_order_release);
   }
   internal::pending = std::move(capture);
   internal::has_pending.store(true, std::memory_order_release);
@@ -1198,6 +1192,7 @@ inline void RecordPreCopy(
   src.pResource = pre_nr_source;
   src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   src.SubresourceIndex = 0;
+  submission::TrackUse(command_list, dst.pResource, internal::pending->proof);
   command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 }
 
@@ -1217,6 +1212,7 @@ inline void RecordPostCopy(
   src.pResource = nr_source;
   src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   src.SubresourceIndex = 0;
+  submission::TrackUse(command_list, dst.pResource, internal::pending->proof);
   command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   internal::pending->ready = true;
 }
@@ -1279,6 +1275,7 @@ inline void RecordDiagnosticPlaneCopy(
     src.pResource = texture;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
+    submission::TrackUse(command_list, dst.pResource, internal::pending->proof);
     command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     return;
   }
@@ -1317,8 +1314,8 @@ inline void SetPendingDiagnosticMeta(std::string meta) {
 }
 
 // Marks an armed or in-flight capture as dead (device loss, NR evaluate
-// failure, new device). The buffers are released by the worker after the
-// settle window.
+// failure, new device). Buffers remain owned until their recorded copies
+// cannot execute again and every actual submission has completed.
 inline void AbortPending() {
   std::scoped_lock lock(internal::state_mutex);
   if (internal::pending.has_value()) internal::pending->aborted = true;
@@ -1326,7 +1323,7 @@ inline void AbortPending() {
 }
 
 // Called once per present with the new generation. Fast path when idle is a
-// single atomic load. Settled captures are moved to the worker; all heavy work
+// two atomic loads. Proven captures are moved to the worker; all heavy work
 // happens off this thread.
 inline void OnPresent(uint64_t generation) noexcept {
   // Armed-timeout: an arm that never sees a DLSS evaluation (loading screen,
@@ -1347,10 +1344,18 @@ inline void OnPresent(uint64_t generation) noexcept {
   } else {
     internal::presents_while_armed.store(0, std::memory_order_relaxed);
   }
-  if (!internal::has_pending.load(std::memory_order_acquire)) return;
+  if (!internal::has_pending.load(std::memory_order_acquire)
+      && !internal::has_retired.load(std::memory_order_acquire)) return;
+  submission::PruneCompletedGenerations();
   std::optional<internal::PendingCapture> work;
   {
     std::scoped_lock lock(internal::state_mutex);
+    std::erase_if(internal::retired_buffers, [](internal::RetiredCaptureBuffers& retired) {
+      if (submission::QueryReadback(retired.proof) == submission::ReadbackState::kPending) return false;
+      retired.Release();
+      return true;
+    });
+    internal::has_retired.store(!internal::retired_buffers.empty(), std::memory_order_release);
     if (!internal::pending.has_value()) {
       internal::has_pending.store(false, std::memory_order_release);
       return;
@@ -1368,63 +1373,37 @@ inline void OnPresent(uint64_t generation) noexcept {
         internal::pending->aborted = true;
       }
     }
-    // The frame presented, so the submissions carrying this frame's copies
-    // are queued: one lease over the tracked fences now proves the copies
-    // executed once completed.  Covers aborted captures too - their buffers
-    // may hold a recorded pre-copy.
-    if (generation > internal::pending->creation_generation
-        && !internal::pending->lease_taken) {
-      internal::pending->lease_taken = true;
-      internal::pending->lease_generation = generation;
-      internal::pending->lease = AcquireGpuLease();
-    }
-    // A settle TIMEOUT cancels delivery and reports failure - it never
-    // establishes GPU completion, so the buffers are not mapped and not
-    // released: they move to the retired set (released behind the next
-    // proven settle or at teardown).  A frame count cannot prove a fence.
-    const bool empty_lease_timeout =
-        internal::pending->lease.empty()
-        && generation
-               >= internal::pending->creation_generation
-                      + internal::kSettlePresents;
-    const bool stalled_lease_timeout =
-        !internal::pending->lease.empty()
-        && !GpuLeaseCompleted(internal::pending->lease)
-        && generation
-               >= internal::pending->lease_generation
-                      + kCaptureLeaseFallbackTicks;
-    if (empty_lease_timeout || stalled_lease_timeout) {
-      static std::atomic_bool logged_cancel_timeout{false};
-      if (!logged_cancel_timeout.exchange(true)) {
-        internal::SafeLog(
-            reshade::log::level::warning,
-            internal::pending->lease.empty()
-                ? "NR screenshot cancelled: no tracked queue fence proved the"
-                  " copies executed before the timeout (buffers retained, no"
-                  " files written)"
-                : "NR screenshot cancelled: the tracked queue fence did not"
-                  " advance before the timeout (present-starved session?"
-                  " buffers retained, no files written)");
+    if (generation <= internal::pending->creation_generation) return;
+    const auto proof = submission::QueryReadback(internal::pending->proof);
+    if (proof == submission::ReadbackState::kPending
+        && std::chrono::steady_clock::now() - internal::pending->recorded_at
+               < internal::kCopyTimeout) return;
+    if (proof != submission::ReadbackState::kCompleted
+        || internal::pending->aborted || !internal::pending->ready) {
+      const char* outcome = proof == submission::ReadbackState::kPending ? "gpu_timeout"
+          : proof == submission::ReadbackState::kDeviceRemoved ? "device_removed"
+          : proof == submission::ReadbackState::kDiscarded ? "discarded"
+          : internal::pending->aborted ? "aborted" : "not_ready";
+      // Notify the report worker now, rather than twenty seconds later.
+      internal::PublishFinished({.serial = internal::pending->serial, .outcome = outcome});
+      internal::SafeLog(reshade::log::level::warning,
+          std::string("NR screenshot cancelled: ") + outcome
+              + " (capture-copy submission proof; no files written)");
+      if (proof == submission::ReadbackState::kPending) {
+        internal::RetiredCaptureBuffers retained;
+        retained.Take(std::move(*internal::pending));
+        internal::retired_buffers.push_back(std::move(retained));
+        internal::has_retired.store(true, std::memory_order_release);
+      } else {
+        internal::ReleaseReadbacks(*internal::pending);
       }
-      internal::RetiredCaptureBuffers retained;
-      retained.Take(std::move(*internal::pending));
       internal::pending.reset();
       internal::has_pending.store(false, std::memory_order_release);
-      internal::retired_buffers.push_back(std::move(retained));
       return;
     }
-    if (internal::pending->lease.empty()) return;  // still waiting for fences
-    if (!GpuLeaseCompleted(internal::pending->lease)) return;
-    if (!internal::pending->ready && !internal::pending->aborted) return;
     work = std::move(*internal::pending);
     internal::pending.reset();
     internal::has_pending.store(false, std::memory_order_release);
-    // Retired buffers from earlier evaluates in the same frame share the frame's
-    // command list and settle together with the final capture.
-    for (internal::RetiredCaptureBuffers& retired : internal::retired_buffers) {
-      retired.Release();
-    }
-    internal::retired_buffers.clear();
   }
   internal::HandoffToWorker(std::move(work));
 }

@@ -27,6 +27,32 @@ struct SourceUnits {
   float unit_nits = 0.f;
 };
 
+// An explicit content override selects the pipeline as well as its units.
+// Otherwise preserve the existing format + NGX HDR-flag inference, including
+// ten-bit SDR. Merely changing SourceUnits after allocation left forced PQ on
+// the SDR codec and forced SDR on the HDR codec (v7.6 field/settings audit).
+inline uint8_t SourceHdrMode(uint8_t format_mode, bool hdr_declared, uint32_t override_encoding) {
+  switch (override_encoding) {
+    case 1: return 0;  // SDR
+    case 2: return 1;  // Linear
+    case 3: return 2;  // PQ
+    default: return hdr_declared ? std::max<uint8_t>(format_mode, 1)
+                                : format_mode == 2 ? 0 : format_mode;
+  }
+}
+
+// Stored modes 0/1 retain v7.5's Auto/Always behavior. New modes: 2 Off,
+// 3 Auto (v7.6), 4 On with independent strength. A positive block-mean lift
+// is not proof that every dark pixel needs subtraction: the PQ GPU case
+// creates black pixels from unchanged 0.1-nit originals. Auto skips that
+// operation on proven PQ units; ambiguous/other sources keep the old rule.
+inline bool PedestalAllowed(uint32_t mode, bool display, const SourceUnits& units) {
+  if (mode == 2) return false;
+  if (mode == 1 || mode == 4) return true;
+  if (mode == 3 && units.encoding == Encoding::Pq && units.absolute) return false;
+  return !display || (units.absolute && units.unit_nits > 0.f);
+}
+
 inline float ClassicLinearDivisor(float paper_white_scale) {
   return std::max(0.0001f, paper_white_scale);
 }

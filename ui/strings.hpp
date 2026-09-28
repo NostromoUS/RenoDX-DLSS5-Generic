@@ -86,27 +86,25 @@ inline constexpr const char* kNrEnableTip =
     "Turns Neural Rendering on and off.  The key shown next to the switch"
     " does the same in game.";
 inline constexpr const char* kIntensityTip =
-    "How strongly Neural Rendering reworks the image: 0 leaves the game's"
-    " image untouched, 1 is the default, 2 the strongest.  A change restarts"
-    " NR's history for a moment.";
+    "Strength of this neural pass: 0 is off, 1 is the default, 2 the strongest."
+    " Other stacked passes have their own strengths. A change restarts history.";
 // Shared by pass 1's HDR rows and every stacked pass's.
 inline constexpr const char* kTransferTip =
-    "Float-HDR games: how much of the model's dark lift is removed when Dark"
-    " pedestal removal is on. Other HDR games: how much of Neural Rendering's"
-    " change reaches the image, from 0 (none) to 1 (all).";
+    "On the Display codec this controls legacy pedestal subtraction only."
+    " On other codecs this blends the neural result: 0 is none, 1 is all."
+    " Independent pedestal controls preserve enhancement when subtraction is off.";
 inline constexpr const char* kTransferInertTip =
-    "Nothing to scale in this game: its HDR brightness is relative, so Dark"
-    " pedestal removal (Auto) leaves the model's dark lift alone.  Set Dark"
-    " pedestal removal to Always to use this slider.";
+    "Inactive on this Display path. Enhancement strength controls the neural"
+    " result; Pedestal strength controls independent subtraction.";
 inline constexpr const char* kColorTip =
-    "On float-HDR games, how much of Neural Rendering's change reaches the"
-    " image: 0 keeps the game's image, 1.00 shows all of it.";
+    "Display codec: blends the whole neural result, from 0 to 1. Other codecs:"
+    " blends colour changes while keeping the transferred brightness.";
 inline constexpr const char* kPaperWhiteTip =
-    "How bright white surfaces glow, in nits (203 is the HDR reference).  PQ"
-    " HDR games only; other HDR games use Scene white scale.";
+    "PQ input anchor in nits (203 by default). Changes the image fed to NR,"
+    " not the display's paper white.";
 inline constexpr const char* kSceneWhiteTip =
-    "The same for float-HDR and classic sources (2.5375 is 203-nit paper"
-    " white).  PQ HDR games use Paper white and PQ calibration instead.";
+    "Fixed input divisor for Classic and Auto with absolute units. On PQ it"
+    " multiplies the PQ anchor and calibration. Relative HDR ignores it.";
 inline constexpr const char* kRebindTip =
     "Click, then press the new key; Esc cancels.";
 inline constexpr const char* kNoneYet = "none yet";

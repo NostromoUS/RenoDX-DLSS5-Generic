@@ -71,6 +71,8 @@
 #include "command_state.hpp"
 #include "evaluate_chain.hpp"
 #include "funnel.hpp"
+#include "input_contract.hpp"
+#include "bridge_motion_shaders.hpp"
 #include "ui/state_card.hpp"
 #include "ui/strings.hpp"
 #include "ui/widgets.hpp"
@@ -147,8 +149,9 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default; a stored 1 (the inherited v6.1.2 default) migrates, a stored 0
 // (explicit Off) is preserved.
 // v8: read v8-only settings through rc10-compatible migration rules.
-constexpr uint32_t kConfigVersion = 8;
-constexpr char kAddonVersion[] = "v7.5.0-rc5";
+// v9: independent pedestal modes; inherited Auto adopts the proven PQ fix.
+constexpr uint32_t kConfigVersion = 9;
+constexpr char kAddonVersion[] = "v7.6.0-rc3";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -277,6 +280,12 @@ enum class FeedSource : uint32_t {
 };
 
 struct FeatureState {
+  contract::Evidence source_contract{};  // immutable capture, including lazy provenance
+  bool create_observed = false;
+  uint64_t source_generation = 0;
+  std::array<uint32_t, 17> resolved_geometry{};
+  bool has_resolved_geometry = false;
+  uint32_t contract_lines = 0;
   NVSDK_NGX_Feature source_feature = kFeatureDlss;
   uint32_t input_width = 0;
   uint32_t input_height = 0;
@@ -715,6 +724,7 @@ struct EvaluationContract {
   uint32_t input_height = 0;
   uint32_t output_width = 0;
   uint32_t output_height = 0;
+  uint32_t motion_width = 0, motion_height = 0;
   uint32_t motion_x = 0;
   uint32_t motion_y = 0;
   uint32_t depth_x = 0;
@@ -792,6 +802,7 @@ inline std::atomic_uint32_t max_worksets = kDefaultMaxWorksets;
 inline std::vector<RetiredFinalResources> retired_final_resources;
 inline std::vector<RetiredNrFeature> retired_nr_features;
 inline ID3D12Device* direct_device = nullptr;
+inline uint64_t direct_device_generation = 0;
 // The same device with ReShade's wrapper peeled off, for IDENTITY only.
 // NGX keeps the wrapper (it is evaluated with the game's wrapped command
 // list and the pair has to match - unwrapping just the device is an
@@ -851,6 +862,7 @@ inline std::unordered_map<const NVSDK_NGX_Handle*, NVSDK_NGX_Feature>
 // dimensions on evaluate. These snapshots own no NR objects and are removed
 // by the game's release hook or tracked device destruction (runtime_mutex).
 inline std::unordered_map<const NVSDK_NGX_Handle*, FeatureState> create_contracts;
+inline uint64_t next_source_generation = 0;
 inline std::unordered_map<uint32_t, StreamlineViewportState> streamline_viewports;
 // std::map keeps node addresses stable; those addresses are used as opaque
 // keys in the existing NGX feature-state table for persistent Streamline
@@ -1235,7 +1247,7 @@ inline constexpr float kProxyAnchorNits = 4.f;
 inline constexpr float kPqCalibration = 1.f;
 // Source-interpretation overrides (advanced).  0 = infer from the resource
 // format (float -> linear HDR, R10G10B10A2 -> PQ, otherwise SDR).
-// NRSourceEncoding 1/2/3 force linear/PQ/SDR; NRLinearUnitNits > 0 declares
+// NRSourceEncoding 1/2/3 force SDR/linear/PQ; NRLinearUnitNits > 0 declares
 // an absolute scRGB scaling (nits per 1.0); NRSourcePrimaries is accepted
 // and logged (the NR proxy is gamut-agnostic today - explicit gamut mapping
 // is future work).
@@ -1264,9 +1276,10 @@ inline constexpr float kChromaClampStops = 1.f;
 // in-game A/B with readback; both modes feed the model an identical proxy.
 inline constexpr uint32_t kTransferMode = 0;
 // The commit's dark-pedestal removal on Display-codec frames
-// (FramePedestalRemoval).  0 = Auto: skipped where the units are relative;
-// 1 = Always: the removal on every HDR frame, the behavior through rc7.
-inline constexpr uint32_t kDisplayPedestal = 0;
+// (FramePedestalRemoval). 0/1 retain legacy Auto/Always; 2 = Off;
+// 3 = Auto, skipping proven PQ and relative Display; 4 = independent On.
+inline constexpr uint32_t kDisplayPedestal = 3;
+inline constexpr float kPedestalStrength = 1.f;
 // Neural-floor chroma guard on the divisor-family resolve (v6_common
 // UpgradeToneMap, Curve 2; ported from v6.6.0's C6, PLAN_REHAB_V7 section 8
 // item 8).  Where the model's value sits at the floor and the pixel is
@@ -1497,16 +1510,17 @@ inline std::atomic<float> nr_resolution_scale = defaults::kResolutionScale;
 // alternation, not deliberate user changes).
 inline std::atomic<bool> nr_resolution_commit_now = false;
 inline std::atomic_uint32_t depth_mode = defaults::kDepthMode;
+inline std::atomic_uint32_t guide_contract_mode{0};
+inline std::atomic_uint32_t output_rect_mode{0};
+inline std::atomic_uint32_t input_rect_mode{0};
 inline std::atomic<float> motion_scale_x_multiplier = defaults::kMvecScale;
 inline std::atomic<float> motion_scale_y_multiplier = defaults::kMvecScale;
 inline std::atomic<float> paper_white_scale = defaults::kPaperWhiteScale;
 // PQ bridge anchor (nits, 80..1000): replaces the hardcoded 203 nits behind
 // the PQ normalization (0.0203 = 203/10000).  Control split vs
-// paper_white_scale: paper white is the display-referred scene gain the codec
-// applies on every mode; diffuse white only relocates the PQ bridge anchor
-// and does not multiply the scene on top of it.  Ignored on the SDR path;
-// the linear HDR path has no separate diffuse-white constant and is
-// untouched.
+// paper_white_scale: Classic/Auto PQ multiply both into the input divisor;
+// PQ Display uses this anchor alone. Anchored, SDR and linear HDR ignore it.
+// This changes NR input scaling, not the output display's paper white.
 inline std::atomic<float> diffuse_white_nits = defaults::kDiffuseWhiteNits;
 inline std::atomic<float> transfer_strength = defaults::kTransferStrength;
 inline std::atomic<float> color_strength = defaults::kColorStrength;
@@ -1514,8 +1528,10 @@ inline std::atomic<float> color_strength = defaults::kColorStrength;
 inline std::atomic<float> chroma_clamp_stops = defaults::kChromaClampStops;
 inline std::atomic<uint32_t> transfer_mode = defaults::kTransferMode;
 inline std::atomic<uint32_t> display_pedestal = defaults::kDisplayPedestal;
+inline std::atomic<float> pedestal_strength = defaults::kPedestalStrength;
+inline std::atomic_bool last_frame_display_codec = false;
 // The last evaluated frame had nothing for HDR Transfer Strength to scale
-// (a Display frame without the pedestal removal): the panel greys it out.
+// (Display with no subtraction or independent subtraction): grey it out.
 inline std::atomic_bool transfer_strength_inert = false;
 inline std::atomic_bool neural_floor_guard = defaults::kNeuralFloorGuard;
 // Normalization governor mode and its rate limits (see defaults).
@@ -3386,6 +3402,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list) {
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kDeviceUnavailable);
     return false;
   }
 
@@ -3499,6 +3516,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list) {
     return false;
   }
   direct_device = device;
+  ++direct_device_generation;
   direct_device_native = device;
   renodx::utils::directx::NativeFromReShadeProxy(&direct_device_native);
   last_nr_device_native = direct_device_native;
@@ -3509,6 +3527,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list) {
 
 inline FeatureState DeriveFeatureState(const NVSDK_NGX_Parameter* parameters) {
   FeatureState state;
+  state.source_contract = contract::Read(parameters);
   state.input_width = GetUInt(
       parameters,
       NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
@@ -4426,8 +4445,8 @@ inline FinalResources* EnsureWorkset(
       || (create_pre_sr_color
           && !CreateScratchTexture(
               device,
-              output_width,
-              output_height,
+              static_cast<uint32_t>(const_cast<ID3D12Resource*>(key)->GetDesc().Width),
+              const_cast<ID3D12Resource*>(key)->GetDesc().Height,
               concrete_format,
               D3D12_RESOURCE_FLAG_NONE,
               D3D12_RESOURCE_STATE_COPY_DEST,
@@ -5034,6 +5053,8 @@ inline bool EnsureNrFeature(
   }
   last_result = static_cast<uint32_t>(result);
   if (NVSDK_NGX_FAILED(result) || slot.handle == nullptr) {
+    evaluation::Note(evaluation::Outcome::kNrFailed);
+    if (evaluation::active) evaluation::active->nr_result = static_cast<uint32_t>(result);
     slot.failed = true;
     slot.failed_ns = SteadyNowNs();
     slot.handle = nullptr;
@@ -5130,8 +5151,8 @@ inline void SetEvaluationParameters(
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.DepthSubrectHeight", frame.input_height);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectBaseX", frame.motion_x);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectBaseY", frame.motion_y);
-  NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectWidth", frame.input_width);
-  NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectHeight", frame.input_height);
+  NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectWidth", frame.motion_width != 0 ? frame.motion_width : frame.input_width);
+  NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MVecSubrectHeight", frame.motion_height != 0 ? frame.motion_height : frame.input_height);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.OutputSubrectBaseX", 0);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.OutputSubrectBaseY", 0);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.OutputSubrectWidth", output_width);
@@ -5304,6 +5325,19 @@ inline void CopyMip0(
   command_list->CopyTextureRegion(&locations[0], 0, 0, 0, &locations[1], nullptr);
 }
 
+// Both windows have been validated against their allocations before recording.
+inline void CopyRect(ID3D12GraphicsCommandList* list, ID3D12Resource* destination,
+                     ID3D12Resource* source, const contract::Rect& rect,
+                     uint32_t destination_x = 0, uint32_t destination_y = 0) {
+  D3D12_TEXTURE_COPY_LOCATION locations[2]{};
+  locations[0].pResource = destination;
+  locations[0].Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  locations[1].pResource = source;
+  locations[1].Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  const D3D12_BOX box{rect.x, rect.y, 0, rect.x + rect.width, rect.y + rect.height, 1};
+  list->CopyTextureRegion(&locations[0], destination_x, destination_y, 0, &locations[1], &box);
+}
+
 // Select the normalization contract for this frame.  Absolute sources use a
 // fixed divisor derived from their calibrated unit contract.  Relative HDR
 // returns zero here; the shaders then read the divisor produced from this same
@@ -5326,36 +5360,32 @@ inline bool FrameDisplayCodec(const FinalResources& resources) {
   return false;
 }
 
-// Whether v6_commit removes the model's dark pedestal on this frame (its
-// PedestalGate).  On a Display frame HDR Transfer Strength scales nothing
-// else: the resolve blends by Color Strength alone.  The removal's gate
-// (DarkGate 0.005) and cap are absolute source units, and a relative-unit
-// frame has none.  Measured on a KCD2 capture (field report, rc6): the scene
-// median was 0.0002, so the "near-black" gate sat 4.6 stops above it and
-// gated 69 % of pixels.  NR's lift there is zero-mean noise (p05/p95
-// +/-8e-5), and the >= 0 clamp turned it into per-block darkening (p95 -0.43
-// stop at strength 1): the shadows flickered, and strength <= 0.25 hid it.
-// The pedestal the removal was built for (v6.0.x's uniform +3 %) went away
-// with v6.1.0's normalization.  So Auto (NRDisplayPedestal=0) skips it on
-// relative Display frames, and 1 keeps it everywhere.  A calibrated absolute
-// source forced onto the Display codec keeps it, as does every divisor-family
-// frame.
-inline bool FramePedestalRemoval(const FinalResources& resources) {
-  if (!FrameDisplayCodec(resources)) return true;
-  if (display_pedestal.load(std::memory_order_relaxed) != 0u) return true;
-  return resources.units.absolute && resources.units.unit_nits > 0.f;
+// The effective curve must agree in constants, capture metadata and logs.
+inline uint32_t FrameCodecCurve(const FinalResources& resources) {
+  return FrameDisplayCodec(resources) ? 1u
+      : resources.hdr_mode != 0 && neural_floor_guard.load(std::memory_order_relaxed) ? 2u : 0u;
 }
 
-// Whether any pass of the chain changes the image (the zero-strength bypass,
-// handoff rule 3).  Where the frame skips the pedestal removal, transfer
-// strength scales nothing, so only color strength counts.
+inline bool FramePedestalRemoval(const FinalResources& resources) {
+  return codec::PedestalAllowed(display_pedestal.load(std::memory_order_relaxed),
+                               FrameDisplayCodec(resources), resources.units)
+      && (display_pedestal.load(std::memory_order_relaxed) != 4u
+          || pedestal_strength.load(std::memory_order_relaxed) > 0.f);
+}
+
+// Only the final commit uses this strength; the resolve and unshaped
+// measurement still receive the pass's neural transfer, unchanged.
+inline float FramePedestalStrength(float pass_transfer) {
+  return display_pedestal.load(std::memory_order_relaxed) == 4u
+      ? pedestal_strength.load(std::memory_order_relaxed) : pass_transfer;
+}
+
+// Color is the Display blend; Transfer is the divisor blend. Counting both
+// kept PQ NR evaluating with Transfer=0 even though its result was invisible.
 inline bool ChainActive(const FinalResources& resources, uint32_t stack) {
-  const bool transfer_acts = FramePedestalRemoval(resources);
+  const bool display = FrameDisplayCodec(resources);
   for (uint32_t pass = 0; pass < stack; ++pass) {
-    if ((transfer_acts && PassTransferStrength(pass) > 0.f)
-        || PassColorStrength(pass) > 0.f) {
-      return true;
-    }
+    if ((display ? PassColorStrength(pass) : PassTransferStrength(pass)) > 0.f) return true;
   }
   return false;
 }
@@ -5496,6 +5526,7 @@ inline void LogFrameContract(
   static uint32_t last_absolute = 0;
   static float last_unit_nits = 0.f;
   static uint32_t last_codec_mode = 0;
+  static uint32_t last_curve = 0;
   static uint32_t last_fixed = 0;
   static uint32_t last_governor = 0;
   static FeedSource last_feed = FeedSource::kV1;
@@ -5516,6 +5547,7 @@ inline void LogFrameContract(
         && static_cast<uint32_t>(res.units.absolute) == last_absolute
         && res.units.unit_nits == last_unit_nits
         && codec_mode.load(std::memory_order_relaxed) == last_codec_mode
+        && FrameCodecCurve(res) == last_curve
         && static_cast<uint32_t>(frame_divisor > 0.f) == last_fixed
         && norm_governor.load(std::memory_order_relaxed) == last_governor
         && feed == last_feed
@@ -5533,6 +5565,7 @@ inline void LogFrameContract(
       << current.create_flags << '|' << static_cast<uint32_t>(res.units.encoding)
       << '|' << res.units.absolute << '|' << res.units.unit_nits << '|'
       << codec_mode.load(std::memory_order_relaxed) << '|'
+      << FrameCodecCurve(res) << '|'
       << (frame_divisor > 0.f ? 1 : 0) << '|'
       << norm_governor.load(std::memory_order_relaxed) << '|'
       << static_cast<uint32_t>(feed) << '|' << pedestal;
@@ -5551,6 +5584,7 @@ inline void LogFrameContract(
     last_absolute = static_cast<uint32_t>(res.units.absolute);
     last_unit_nits = res.units.unit_nits;
     last_codec_mode = codec_mode.load(std::memory_order_relaxed);
+    last_curve = FrameCodecCurve(res);
     last_fixed = static_cast<uint32_t>(frame_divisor > 0.f);
     last_governor = norm_governor.load(std::memory_order_relaxed);
     last_feed = feed;
@@ -5599,11 +5633,14 @@ inline void LogFrameContract(
           << ",epoch:" << norm_snap_epoch.load(std::memory_order_relaxed)
           << ",reset:" << norm_snap_reset.load(std::memory_order_relaxed)
           << "} ws=" << res.id
-          << " curve=" << (FrameDisplayCodec(res) ? 1u : 0u)
+          << " curve=" << FrameCodecCurve(res)
           << " exposure=" << ExposureContractText(current.exposure)
           << " feed=" << FeedText(feed)
           << " stack=" << res.stack_passes
-          << " pedestal=" << (pedestal ? "on" : "off");
+          << " pedestal=" << (pedestal ? "on" : "off")
+          << " pedestal_mode=" << display_pedestal.load(std::memory_order_relaxed)
+          << " pedestal_strength=" << (pedestal
+              ? FramePedestalStrength(PassTransferStrength(res.stack_passes - 1)) : 0.f);
   Log(reshade::log::level::info, message.str());
 }
 
@@ -5785,9 +5822,7 @@ inline void BindCodecV6(
       color_strength,
       encoding,
       dark_gate,
-      FrameDisplayCodec(resources)                               ? 1u
-      : neural_floor_guard.load(std::memory_order_relaxed) ? 2u
-                                                           : 0u,
+      FrameCodecCurve(resources),
       // PedestalGate: the commit's dark-pedestal removal on this frame.
       FramePedestalRemoval(resources) ? 1.f : 0.f,
       0.f,
@@ -6403,6 +6438,117 @@ inline LookRoute RunLookStage(
           res.height, true};
 }
 
+inline evaluation::Resource ContractResource(ID3D12Resource* resource) {
+  if (resource == nullptr) return {};
+  const auto d = resource->GetDesc();
+  return {d.Width, d.Height, static_cast<uint32_t>(d.Format), static_cast<uint32_t>(d.Flags),
+          d.MipLevels, d.DepthOrArraySize, static_cast<uint16_t>(d.SampleDesc.Count),
+          static_cast<uint16_t>(d.Dimension)};
+}
+
+inline contract::Resolved ResolveGameContract(FeatureState* current, FeatureState* feature,
+                                             const NVSDK_NGX_Parameter* parameters) {
+  std::array<evaluation::Resource, 5> resources{};
+  const char* keys[] = {NVSDK_NGX_Parameter_Color, NVSDK_NGX_Parameter_Output,
+      NVSDK_NGX_Parameter_MotionVectors, NVSDK_NGX_Parameter_Depth,
+      NVSDK_NGX_Parameter_ExposureTexture};
+  for (size_t i = 0; i < resources.size(); ++i) resources[i] = ContractResource(GetD3D12Resource(parameters, keys[i]));
+  contract::Resolved legacy;
+  legacy.width = current->input_width != 0 ? current->input_width
+      : feature->create_input_width != 0 ? feature->create_input_width : feature->input_width;
+  legacy.height = current->input_height != 0 ? current->input_height
+      : feature->create_input_height != 0 ? feature->create_input_height : feature->input_height;
+  legacy.flags = feature->create_flags;
+  const bool old_motion = current->motion_x == 0 && current->motion_y == 0;
+  const bool old_depth = current->depth_x == 0 && current->depth_y == 0;
+  legacy.motion_x = old_motion ? feature->motion_x : current->motion_x;
+  legacy.motion_y = old_motion ? feature->motion_y : current->motion_y;
+  legacy.depth_x = old_depth ? feature->depth_x : current->depth_x;
+  legacy.depth_y = old_depth ? feature->depth_y : current->depth_y;
+  const auto modes = evaluation::active ? evaluation::active->modes
+      : std::array<uint32_t, 3>{guide_contract_mode.load(), output_rect_mode.load(), input_rect_mode.load()};
+  const auto resolved = contract::Resolve(current->source_contract, feature->source_contract,
+      feature->create_observed, legacy, resources[0], resources[1], resources[2],
+      modes[0], modes[1], modes[2]);
+  current->input_width = resolved.width;
+  current->input_height = resolved.height;
+  current->motion_x = resolved.motion_x;
+  current->motion_y = resolved.motion_y;
+  current->depth_x = resolved.depth_x;
+  current->depth_y = resolved.depth_y;
+  current->motion_scale_x = resolved.scale_x;
+  current->motion_scale_y = resolved.scale_y;
+  current->create_flags = feature->create_flags = resolved.flags;
+  current->exposure.auto_exposure = (resolved.flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0;
+  if (evaluation::active != nullptr) {
+    auto& record = *evaluation::active;
+    if (!record.raw_available) { record.raw = current->source_contract; record.raw_available = true; }
+    record.captured = feature->source_contract;
+    record.device_generation = direct_device_generation;
+    record.eligibility = 1;
+    record.create_seen = feature->create_observed;
+    record.generation = feature->source_generation;
+    record.feature = static_cast<uint32_t>(feature->source_feature);
+    if (record.route == evaluation::Route::kBridgeBefore || record.route == evaluation::Route::kBridgeAfter) {
+      record.transport = resources;
+    } else {
+      record.source = resources;
+    }
+    record.resolved = {resolved.width, resolved.height, resolved.motion_x, resolved.motion_y,
+        resolved.motion_width, resolved.motion_height, resolved.depth_x, resolved.depth_y,
+        resolved.output.x, resolved.output.y, resolved.output.width, resolved.output.height,
+        resolved.color.x, resolved.color.y, resolved.color.width, resolved.color.height,
+        resolved.flags, resolved.flags_source, resolved.scale_sources, resolved.notes,
+        resolved.size_sources, resolved.base_sources, resolved.output_source, resolved.color_source};
+    record.scale_x = resolved.scale_x;
+    record.scale_y = resolved.scale_y;
+  }
+  // Geometry changes reset only this stream. Per-frame jitter/exposure do not.
+  const std::array<uint32_t, 17> geometry{resolved.width, resolved.height,
+      resolved.motion_x, resolved.motion_y, resolved.motion_width, resolved.motion_height,
+      resolved.depth_x, resolved.depth_y, resolved.output.x, resolved.output.y,
+      resolved.output.width, resolved.output.height, resolved.color.x, resolved.color.y,
+      resolved.color.width, resolved.color.height, resolved.flags};
+  if ((!feature->has_resolved_geometry || feature->resolved_geometry != geometry)
+      && feature->contract_lines < 8) {
+    ++feature->contract_lines;
+    const bool display = (resolved.flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) == 0
+        && resolved.motion_width == resolved.output.width && (resolved.notes & 4) == 0;
+    const bool disagreement = current->source_contract[contract::OutWidth].present
+        && contract::UInt(current->source_contract, contract::OutWidth) != resolved.output.width;
+    std::ostringstream line;
+    line << "NR guide contract: out=" << resolved.output.x << ',' << resolved.output.y
+         << ' ' << resolved.output.width << 'x' << resolved.output.height
+         << " of " << resources[1].width << 'x' << resources[1].height
+         << " subrects=" << (resolved.output_source != 0);
+    if (disagreement && resolved.output_source == 0)
+      line << (modes[1] == 2 ? " (declared out ignored: resource mode)"
+                            : " (declared out ignored: create wins)");
+    line << " mvec=" << (display ? "display" : "render") << " base="
+         << resolved.motion_x << ',' << resolved.motion_y << " window="
+         << resolved.motion_width << 'x' << resolved.motion_height << " of "
+         << resources[2].width << 'x' << resources[2].height
+         << " scale=" << resolved.scale_x << ',' << resolved.scale_y
+         << " flags_source=" << resolved.flags_source << " notes=" << resolved.notes
+         << " out_declared_disagree=" << disagreement;
+    Log(reshade::log::level::info, line.str());
+    if (evaluation::active && (evaluation::active->route == evaluation::Route::kBefore
+        || evaluation::active->route == evaluation::Route::kBridgeBefore)
+        && resolved.color_source != 0 && (resolved.color.x != 0 || resolved.color.y != 0
+        || resolved.color.width != resources[0].width || resolved.color.height != resources[0].height)) {
+      Log(reshade::log::level::info, "pre-SR NR reads the render subrect: "
+          + std::to_string(resolved.color.x) + "," + std::to_string(resolved.color.y) + " "
+          + std::to_string(resolved.color.width) + "x" + std::to_string(resolved.color.height));
+    }
+  }
+  if (feature->has_resolved_geometry && feature->resolved_geometry != geometry) {
+    for (auto& slot : feature->slots) slot.pending_reset = true;
+  }
+  feature->resolved_geometry = geometry;
+  feature->has_resolved_geometry = true;
+  return resolved;
+}
+
 inline bool SubrectFits(
     uint32_t base_x,
     uint32_t base_y,
@@ -6465,6 +6611,7 @@ FindOrRegisterFeature(
   }
   FeatureState state = DeriveFeatureState(game_parameters);
   state.source_feature = kFeatureDlss;
+  state.source_generation = ++next_source_generation;
   return features.emplace(handle, state).first;
 }
 
@@ -6599,12 +6746,13 @@ inline void LogNrWorkingResolutionReduced(
 // contract. The game's original result is retained unless every NR step works.
 inline bool IsSupportedInjectionCommandList(
     ID3D12GraphicsCommandList* command_list) {
-  if (command_list == nullptr) return false;
+  if (command_list == nullptr) { evaluation::Note(evaluation::Outcome::kListUnsupported); return false; }
   const D3D12_COMMAND_LIST_TYPE type = command_list->GetType();
   if (type == D3D12_COMMAND_LIST_TYPE_DIRECT
       || type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
     return true;
   }
+  evaluation::Note(evaluation::Outcome::kListUnsupported);
   static std::atomic_bool logged_unsupported_command_list{false};
   if (!logged_unsupported_command_list.exchange(true)) {
     Log(
@@ -6621,6 +6769,13 @@ inline bool ProcessInline(
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* game_parameters,
     bool* command_list_touched = nullptr) {
+  if (evaluation::active != nullptr) {
+    evaluation::active->attempted = true;
+    if (evaluation::active->route != evaluation::Route::kBridgeBefore
+        && evaluation::active->route != evaluation::Route::kBridgeAfter
+        && evaluation::active->route != evaluation::Route::kStreamline)
+      evaluation::active->route = evaluation::Route::kAfter;
+  }
   if (!enabled.load() || command_list == nullptr || handle == nullptr
       || game_parameters == nullptr
       || !IsSupportedInjectionCommandList(command_list)) {
@@ -6650,7 +6805,7 @@ inline bool ProcessInline(
                 " To fix: set EnableHooks=1 in the [RenoDX.DLSS5] section of"
                 " ReShade.ini and restart the game");
     }
-    CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
+    CountNrDecline(NrDeclineReason::kNgxMissingGuides);
     streamline_escalation_deficits.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -6694,6 +6849,7 @@ inline bool ProcessInline(
               + "); requires a single-sample 2D texture");
     }
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kDeviceUnavailable);
     return false;
   }
   if (output_desc.MipLevels != 1 && !logged_multimip_output.exchange(true)) {
@@ -6721,90 +6877,30 @@ inline bool ProcessInline(
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kDeviceUnavailable);
     return false;
   }
 
   auto entry = FindOrRegisterFeature(handle, game_parameters, "");
   FeatureState& feature = entry->second;
+  FeatureState current = DeriveFeatureState(game_parameters);
+  const auto resolved = ResolveGameContract(&current, &feature, game_parameters);
+  ObserveGameFrame(current);
   // HDR transfer mode must be current before the NR codec/resources are
   // dimensioned.  Infer it from the actual DLSS output format (linear FP16/R11G11B10
   // -> scene-linear, R10G10B10A2 -> PQ) and promote a bare SDR format to linear
   // when the game set the NGX IsHDR create flag.
   const DXGI_FORMAT output_format = ConcreteResourceFormat(output_desc.Format);
-  uint8_t hdr_mode = InferHdrMode(output_format);
-  if ((feature.create_flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0) {
-    // Game explicitly signalled HDR: promote a bare SDR format to linear-HDR.
-    if (hdr_mode == 0) hdr_mode = 1;
-  } else if (output_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-    // No HDR flag: a 10-bit R10G10B10A2 output is SDR (e.g. Control), NOT PQ.
-    // Only treat R10G10B10A2 as PQ when the game set the HDR flag.
-    hdr_mode = 0;
-  }
-  FeatureState current = DeriveFeatureState(game_parameters);
-  ObserveGameFrame(current);
-  // KCD2 (and most titles) send the full DLSS subrect/size contract only at
-  // CreateFeature, not on every EvaluateFeature.  Trust the create-captured
-  // contract stored in `feature` for the guide (input) dimensions and subrects;
-  // adopt a per-evaluate value only when the game actually supplied one. Output
-  // dimensions come from the real output resource (ground truth).
-  if (current.input_width == 0) {
-    current.input_width = feature.create_input_width != 0
-        ? feature.create_input_width
-        : feature.input_width;
-  }
-  if (current.input_height == 0) {
-    current.input_height = feature.create_input_height != 0
-        ? feature.create_input_height
-        : feature.input_height;
-  }
-  if (current.motion_x == 0 && current.motion_y == 0) {
-    current.motion_x = feature.motion_x;
-    current.motion_y = feature.motion_y;
-  }
-  if (current.depth_x == 0 && current.depth_y == 0) {
-    current.depth_x = feature.depth_x;
-    current.depth_y = feature.depth_y;
-  }
-  // Absent per-axis motion scales default to the FINAL guide dims (the
-  // create-contract fallback above has already applied), never to the zero
-  // dims a per-evaluate block can still carry at DeriveFeatureState time.
-  if (!current.has_motion_scale_x) {
-    current.motion_scale_x = static_cast<float>(current.input_width);
-  }
-  if (!current.has_motion_scale_y) {
-    current.motion_scale_y = static_cast<float>(current.input_height);
-  }
-  const uint32_t width = static_cast<uint32_t>(output_desc.Width);
-  const uint32_t height = static_cast<uint32_t>(output_desc.Height);
+  const uint8_t hdr_mode = codec::SourceHdrMode(
+      InferHdrMode(output_format),
+      (feature.create_flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0,
+      source_encoding.load(std::memory_order_relaxed));
+  const uint32_t width = resolved.output.width;
+  const uint32_t height = resolved.output.height;
   if (current.input_width == 0 || current.input_height == 0) {
-    // Last-resort derive: the NGX Color (the DLSS input image) is
-    // render-resolution by definition, so when neither the per-evaluate
-    // block nor the create-captured contract carries guide dims, its
-    // resource desc IS the guide contract (mirrors the pre-SR path's use of
-    // Color geometry).  Games that set sizes only on a CreateFeature our
-    // hook never saw used to decline forever.
-    auto* color_resource =
-        GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Color);
-    if (color_resource != nullptr) {
-      const D3D12_RESOURCE_DESC color_desc = color_resource->GetDesc();
-      if (color_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-        if (current.input_width == 0) {
-          current.input_width = static_cast<uint32_t>(color_desc.Width);
-        }
-        if (current.input_height == 0) {
-          current.input_height = color_desc.Height;
-        }
-      }
-    }
-  }
-  if (current.input_width == 0 || current.input_height == 0) {
-    last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kNoGuideSize);
     if (!logged_no_guide_dims.exchange(true)) {
-      Log(reshade::log::level::warning,
-          "NR skipped: the game's NGX contract has no guide (input) dimensions."
-          " If the game uses NVIDIA Streamline, set EnableHooks=1 in the"
-          " [RenoDX.DLSS5] section of ReShade.ini and restart; otherwise this"
-          " title is not supported and NR stays off");
+      Log(reshade::log::level::warning, "NR skipped: the game's NGX contract has no guide (input) dimensions.");
     }
     device->Release();
     return false;
@@ -6888,12 +6984,6 @@ inline bool ProcessInline(
   feature.motion_y = current.motion_y;
   feature.depth_x = current.depth_x;
   feature.depth_y = current.depth_y;
-  int32_t evaluation_flags = 0;
-  if (NVSDK_NGX_SUCCEED(game_parameters->Get(
-          NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-          &evaluation_flags))) {
-    feature.create_flags = static_cast<uint32_t>(evaluation_flags);
-  }
   feature.motion_scale_x = current.motion_scale_x;
   feature.motion_scale_y = current.motion_scale_y;
   feature.perf_quality = current.perf_quality;
@@ -6967,23 +7057,8 @@ inline bool ProcessInline(
     // secondary pass composing after the main pass must not steal the capture
     // (the "black frame with a single object" failure).  Equal-or-larger area
     // always supersedes.
-    uint32_t capture_x = GetUInt(
-        game_parameters, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, 0);
-    uint32_t capture_y = GetUInt(
-        game_parameters, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, 0);
-    uint32_t capture_w = width;
-    uint32_t capture_h = height;
-    // Engines that render DLSS into a subrect of a larger output resource
-    // (DLSSG-era pipelines) leave unrendered black margins around the actual
-    // image; crop the capture to the engine-declared output rect when it is
-    // smaller than the resource.  Absent/zero params capture the full
-    // resource exactly as before.
-    if (current.output_width != 0 && current.output_width < capture_w) {
-      capture_w = current.output_width;
-    }
-    if (current.output_height != 0 && current.output_height < capture_h) {
-      capture_h = current.output_height;
-    }
+    const uint32_t capture_x = 0, capture_y = 0;
+    const uint32_t capture_w = width, capture_h = height;
     const uint64_t capture_area =
         static_cast<uint64_t>(capture_w) * capture_h;
     if (!screenshot::HasPending()
@@ -7041,6 +7116,7 @@ inline bool ProcessInline(
   // exact state before doing any private work. From this point onward an early
   // return must restore the host compute state captured around the real evaluate.
   if (command_list_touched != nullptr) *command_list_touched = true;
+  if (evaluation::active != nullptr) evaluation::active->recorded = true;
   // Per-stage GPU timestamps (NRGpuTimers): begin the frame segment before
   // the copy-in so the copies are inside the measured total.
   const bool timers_active = gpu_timers_enabled.load(std::memory_order_relaxed);
@@ -7060,7 +7136,7 @@ inline bool ProcessInline(
       command_list, res.original,
       res.original_state,
       D3D12_RESOURCE_STATE_COPY_DEST);
-  CopyMip0(command_list, res.original, output);
+  CopyRect(command_list, res.original, output, resolved.output);
   Transition(
       command_list, output,
       D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7095,6 +7171,8 @@ inline bool ProcessInline(
   frame.input_height = current.input_height;
   frame.output_width = width;
   frame.output_height = height;
+  frame.motion_width = resolved.motion_width;
+  frame.motion_height = resolved.motion_height;
   frame.motion_x = current.motion_x;
   frame.motion_y = current.motion_y;
   frame.depth_x = current.depth_x;
@@ -7150,10 +7228,13 @@ inline bool ProcessInline(
          << "\nunit_nits=" << res.units.unit_nits
          << "\nhdr_mode=" << static_cast<uint32_t>(res.hdr_mode)
          << "\ncodec_mode=" << codec_mode.load()
-         << "\ncurve=" << (FrameDisplayCodec(res) ? 1u : 0u)
+         << "\ncurve=" << FrameCodecCurve(res)
          << "\nnormalization=" << (frame_divisor > 0.f ? "fixed" : "gpu-frame")
          << "\ndivisor=" << frame_divisor
          << "\npedestal_cap=" << v6_pedestal_cap
+         << "\npedestal_mode=" << display_pedestal.load()
+         << "\npedestal_strength=" << (FramePedestalRemoval(res)
+             ? FramePedestalStrength(PassTransferStrength(requested_stack - 1)) : 0.f)
          << "\ndark_gate=" << v6_dark_gate
          << "\nstack=" << requested_stack
          << "\nchroma_clamp=" << chroma_clamp_stops.load(std::memory_order_relaxed)
@@ -7162,12 +7243,15 @@ inline bool ProcessInline(
             "(post-transfer,pre-pedestal)\n";
     screenshot::SetPendingDiagnosticMeta(meta.str());
   }
-  // Exact zero-transfer bypass (handoff rule 3): with every pass's transfer
-  // and color strength at zero the chain contributes nothing, so an HDR
+  // With every pass's effective blend at zero the chain contributes nothing.
+  // Display uses Color, divisor codecs use Transfer. In that case an HDR
   // frame records nothing at all - no linearize, no autoscale, no evaluate, and
   // above all no encode-back - and the game output passes through
   // bit-identical (no PQ roundtrip, no clamping).
-  transfer_strength_inert.store(!FramePedestalRemoval(res), std::memory_order_relaxed);
+  last_frame_display_codec.store(FrameDisplayCodec(res), std::memory_order_relaxed);
+  transfer_strength_inert.store(FrameDisplayCodec(res)
+      && (!FramePedestalRemoval(res) || display_pedestal.load() == 4u),
+      std::memory_order_relaxed);
   if (res.hdr_mode != 0 && !ChainActive(res, requested_stack)) {
     // Explicit zero strength is the only v6 image-path bypass.
     if (timers_active) {
@@ -7527,6 +7611,10 @@ inline bool ProcessInline(
       }
     }
     last_result = static_cast<uint32_t>(nr_result);
+    if (evaluation::active) {
+      evaluation::active->nr_result = static_cast<uint32_t>(nr_result);
+      ++evaluation::active->nr_calls;
+    }
     if (NVSDK_NGX_FAILED(nr_result)) {
       stack_failure = nr_result;
       failed_pass = pass;
@@ -7746,7 +7834,7 @@ inline bool ProcessInline(
           height,
           frame_divisor,
           v6_pedestal_cap,
-          final_pass_transfer,
+          FramePedestalStrength(final_pass_transfer),
           final_pass_color,
           v6_encoding,
           v6_dark_gate,
@@ -7778,7 +7866,8 @@ inline bool ProcessInline(
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_COPY_DEST,
           0u);
-      CopyMip0(command_list, output, res.decoded);
+      CopyRect(command_list, output, res.decoded, {0, 0, width, height},
+               resolved.output.x, resolved.output.y);
       Transition(
           command_list, output,
           D3D12_RESOURCE_STATE_COPY_DEST,
@@ -7817,7 +7906,8 @@ inline bool ProcessInline(
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_COPY_DEST,
           0u);
-      CopyMip0(command_list, output, final_surface);
+      CopyRect(command_list, output, final_surface, {0, 0, width, height},
+               resolved.output.x, resolved.output.y);
       Transition(
           command_list, output,
           D3D12_RESOURCE_STATE_COPY_DEST,
@@ -7870,6 +7960,8 @@ inline bool ProcessInline(
       feature.slots[later].pending_reset = true;
     }
     std::ostringstream message;
+    evaluation::Note(evaluation::Outcome::kNrFailed);
+    if (evaluation::active != nullptr) evaluation::active->nr_result = static_cast<uint32_t>(stack_failure);
     message << "feature 18 evaluate failed with 0x" << std::hex
             << static_cast<uint32_t>(stack_failure)
             << " (stack pass " << (failed_pass + 1) << '/'
@@ -7903,6 +7995,10 @@ inline bool ProcessInline(
     return true;
   }
   for (auto& slot : feature.slots) slot.fail_count = 0;
+  evaluation::Completed(evaluation::active != nullptr
+      && evaluation::active->route == evaluation::Route::kBridgeAfter
+          ? evaluation::Route::kBridgeAfter : evaluation::active && evaluation::active->route == evaluation::Route::kStreamline
+          ? evaluation::Route::kStreamline : evaluation::Route::kAfter);
   const uint64_t count = ++successful_evaluations;
   streamline_escalation_deficits.store(0, std::memory_order_relaxed);
   last_input_width = nr_input_width;
@@ -7983,20 +8079,35 @@ inline bool ProcessInlinePreSR(
     // recording started - the bool return alone conflates "injected" with
     // "declined before recording").
     bool* commands_recorded = nullptr) {
+  if (evaluation::active != nullptr) {
+    evaluation::active->attempted = true;
+    if (evaluation::active->route != evaluation::Route::kBridgeBefore
+        && evaluation::active->route != evaluation::Route::kBridgeAfter
+        && evaluation::active->route != evaluation::Route::kStreamline)
+      evaluation::active->route = evaluation::Route::kBefore;
+  }
   if (!enabled.load() || !nr_before_upscale.load() || command_list == nullptr
       || handle == nullptr || game_parameters == nullptr
       || !IsSupportedInjectionCommandList(command_list)) {
     return false;
   }
   InjectedCommandScope injected_command_scope;
-  if (!IsDlssEvaluation(game_parameters)) return false;
+  if (!IsDlssEvaluation(game_parameters)) {
+    evaluation::Note(evaluation::Outcome::kMissingInput);
+    CountNrDecline(NrDeclineReason::kNgxMissingGuides);
+    return false;
+  }
 
   auto* color = GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Color);
   auto* motion = GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_MotionVectors);
   auto* depth = GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Depth);
   auto* exposure =
       GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_ExposureTexture);
-  if (color == nullptr || motion == nullptr || depth == nullptr) return false;
+  if (color == nullptr || motion == nullptr || depth == nullptr) {
+    evaluation::Note(evaluation::Outcome::kMissingInput);
+    CountNrDecline(NrDeclineReason::kNgxMissingGuides);
+    return false;
+  }
 
   // One NR pass per color surface per present per source handle
   // (mirrors the after path's admission; pre-SR never mixes with the
@@ -8022,6 +8133,32 @@ inline bool ProcessInlinePreSR(
     }
     return false;
   }
+  // Initialize the direct runtime before the feature lookup: a device change
+  // inside EnsureDirectRuntime releases every feature state, so the
+  // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
+  if (!EnsureDirectRuntime(command_list)) {
+    // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
+    // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
+    // counting anything.  The verdict said UNAVAILABLE and was right; the
+    // funnel under it read `unaccounted=239` out of 240 (measured by the
+    // `no_nr_runtime` lane on its first run), which is T-SILENT's own
+    // definition of a leak.  Only the two evaluate-path terminals count:
+    // EnsureNrFeature reaches its copy of this check inside an injection
+    // that already passed one, so counting there would double-count.
+    CountNrDecline(NrDeclineReason::kNrRuntimeUnavailable);
+    return false;
+  }
+  ID3D12Device* device = nullptr;
+  if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+    last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kDeviceUnavailable);
+    return false;
+  }
+  auto entry = FindOrRegisterFeature(handle, game_parameters, "pre-SR ");
+  FeatureState& feature = entry->second;
+  FeatureState current = DeriveFeatureState(game_parameters);
+  const auto resolved = ResolveGameContract(&current, &feature, game_parameters);
+  ObserveGameFrame(current);
   const uint32_t color_w = static_cast<uint32_t>(color_desc.Width);
   const uint32_t color_h = color_desc.Height;
   // Region acceptance (v6.2): engines allocate guides at source OR target
@@ -8044,20 +8181,20 @@ inline bool ProcessInlinePreSR(
       [color_w, color_h, declared_out_w, declared_out_h](
           uint32_t guide_w, uint32_t guide_h) {
         const bool source_region =
-            guide_w <= color_w && guide_w * 8u >= color_w
-            && guide_h <= color_h && guide_h * 8u >= color_h;
+            guide_w <= color_w && uint64_t(guide_w) * 8u >= color_w
+            && guide_h <= color_h && uint64_t(guide_h) * 8u >= color_h;
         const bool target_region =
             declared_out_w != 0 && declared_out_h != 0
-            && guide_w * 8u >= declared_out_w * 7u
-            && guide_w * 8u <= declared_out_w * 9u
-            && guide_h * 8u >= declared_out_h * 7u
-            && guide_h * 8u <= declared_out_h * 9u;
+            && uint64_t(guide_w) * 8u >= uint64_t(declared_out_w) * 7u
+            && uint64_t(guide_w) * 8u <= uint64_t(declared_out_w) * 9u
+            && uint64_t(guide_h) * 8u >= uint64_t(declared_out_h) * 7u
+            && uint64_t(guide_h) * 8u <= uint64_t(declared_out_h) * 9u;
         return source_region || target_region;
       };
   const bool guides_in_region =
       guide_in_region(motion_desc.Width, motion_desc.Height)
       && guide_in_region(depth_desc.Width, depth_desc.Height);
-  if (!guides_in_region) {
+  if (!guides_in_region && resolved.color_source == 0) {
     CountNrDecline(NrDeclineReason::kPreSrGeometry);
     static std::atomic<bool> logged_guide_mismatch{false};
     if (!logged_guide_mismatch.exchange(true)) {
@@ -8074,75 +8211,16 @@ inline bool ProcessInlinePreSR(
               + std::to_string(depth_desc.Height)
               + "); the frame runs without NR");
     }
+    device->Release();
     return false;
   }
-  const uint32_t width = static_cast<uint32_t>(std::min<UINT64>(
-      std::min<UINT64>(motion_desc.Width, depth_desc.Width), color_w));
-  const uint32_t height = static_cast<uint32_t>(std::min<UINT64>(
-      std::min<UINT64>(motion_desc.Height, depth_desc.Height), color_h));
-  if (width != color_w || height != color_h) {
-    static std::atomic<bool> logged_region_clamp{false};
-    if (!logged_region_clamp.exchange(true)) {
-      Log(
-          reshade::log::level::info,
-          "pre-SR NR region clamped to the common guide region "
-              + std::to_string(width) + "x" + std::to_string(height)
-              + " (color " + std::to_string(color_w) + "x"
-              + std::to_string(color_h) + ")");
-    }
-  }
+  const uint32_t width = resolved.color_source == 0
+      ? static_cast<uint32_t>((std::min)({motion_desc.Width, depth_desc.Width, UINT64(color_w)}))
+      : resolved.color.width;
+  const uint32_t height = resolved.color_source == 0
+      ? (std::min)({motion_desc.Height, depth_desc.Height, color_h}) : resolved.color.height;
+  const contract::Rect color_rect{resolved.color.x, resolved.color.y, width, height};
 
-  // Initialize the direct runtime before the feature lookup: a device change
-  // inside EnsureDirectRuntime releases every feature state, so the
-  // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
-  if (!EnsureDirectRuntime(command_list)) {
-    // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
-    // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
-    // counting anything.  The verdict said UNAVAILABLE and was right; the
-    // funnel under it read `unaccounted=239` out of 240 (measured by the
-    // `no_nr_runtime` lane on its first run), which is T-SILENT's own
-    // definition of a leak.  Only the two evaluate-path terminals count:
-    // EnsureNrFeature reaches its copy of this check inside an injection
-    // that already passed one, so counting there would double-count.
-    CountNrDecline(NrDeclineReason::kNrRuntimeUnavailable);
-    return false;
-  }
-  ID3D12Device* device = nullptr;
-  if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
-    last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
-    return false;
-  }
-  auto entry = FindOrRegisterFeature(handle, game_parameters, "pre-SR ");
-  FeatureState& feature = entry->second;
-  FeatureState current = DeriveFeatureState(game_parameters);
-  ObserveGameFrame(current);
-  if (current.input_width == 0) {
-    current.input_width = feature.create_input_width != 0
-        ? feature.create_input_width
-        : feature.input_width;
-  }
-  if (current.input_height == 0) {
-    current.input_height = feature.create_input_height != 0
-        ? feature.create_input_height
-        : feature.input_height;
-  }
-  if (current.motion_x == 0 && current.motion_y == 0) {
-    current.motion_x = feature.motion_x;
-    current.motion_y = feature.motion_y;
-  }
-  if (current.depth_x == 0 && current.depth_y == 0) {
-    current.depth_x = feature.depth_x;
-    current.depth_y = feature.depth_y;
-  }
-  // Same presence-aware default as the after path: only after the final guide
-  // dims are known (the synthetic pre-SR block always sets MV scales, but a
-  // native block that reached this path without them still defaults sanely).
-  if (!current.has_motion_scale_x) {
-    current.motion_scale_x = static_cast<float>(current.input_width);
-  }
-  if (!current.has_motion_scale_y) {
-    current.motion_scale_y = static_cast<float>(current.input_height);
-  }
   if (!SupportsCodecFormat(
           device, CodecViewFormat(ConcreteResourceFormat(color_desc.Format)))) {
     static std::atomic<bool> logged_color_format{false};
@@ -8152,6 +8230,7 @@ inline bool ProcessInlinePreSR(
           "pre-SR NR declined: the NGX Color format is not shader-readable"
           " (requires sampling + typed UAV support)");
     }
+    CountNrDecline(NrDeclineReason::kWorksetSetupFailed);
     device->Release();
     return false;
   }
@@ -8189,23 +8268,14 @@ inline bool ProcessInlinePreSR(
     }
   }
 
-  int32_t evaluation_flags = 0;
-  if (NVSDK_NGX_SUCCEED(game_parameters->Get(
-          NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-          &evaluation_flags))) {
-    feature.create_flags = static_cast<uint32_t>(evaluation_flags);
-  }
   // The codec HDR mode is derived from the COLOR surface - it is what gets
   // encoded, not the (here never-written) output copy.  Computed before the
   // adapt/recreate checks so the NR feature's create flags track it.
   const DXGI_FORMAT color_format = ConcreteResourceFormat(color_desc.Format);
-  uint8_t hdr_mode = InferHdrMode(color_format);
-  if ((feature.create_flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0) {
-    if (hdr_mode == 0) hdr_mode = 1;
-  } else if (color_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-    // No HDR flag: a 10-bit R10G10B10A2 color is SDR (e.g. Control), not PQ.
-    hdr_mode = 0;
-  }
+  const uint8_t hdr_mode = codec::SourceHdrMode(
+      InferHdrMode(color_format),
+      (feature.create_flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0,
+      source_encoding.load(std::memory_order_relaxed));
   const uint32_t requested_stack = std::clamp(stack_passes.load(), 1u, kMaxNrPasses);
   // NR working resolution (v5.1): the same controls as the after path, with
   // the NGX color surface as the reference - pre-SR has no separate output
@@ -8307,6 +8377,9 @@ inline bool ProcessInlinePreSR(
     return false;
   }
   FinalResources& res = *workset;
+  const bool crop_color = color_rect.x != 0 || color_rect.y != 0
+      || width != color_w || height != color_h;
+  ID3D12Resource* const pipeline_color = crop_color ? res.original : color;
   if (res.pre_sr_source == nullptr) {
     color->AddRef();
     res.pre_sr_source = color;
@@ -8343,7 +8416,10 @@ inline bool ProcessInlinePreSR(
   // Exact zero-transfer bypass (handoff rule 3): an HDR frame with every
   // pass at zero strength records nothing at all - the game's evaluate runs
   // on its own color, bit-identical to no-addon.
-  transfer_strength_inert.store(!FramePedestalRemoval(res), std::memory_order_relaxed);
+  last_frame_display_codec.store(FrameDisplayCodec(res), std::memory_order_relaxed);
+  transfer_strength_inert.store(FrameDisplayCodec(res)
+      && (!FramePedestalRemoval(res) || display_pedestal.load() == 4u),
+      std::memory_order_relaxed);
   if (res.hdr_mode != 0 && !ChainActive(res, requested_stack)) {
     // Explicit zero strength is the only v6 image-path bypass; the game's
     // own evaluate runs on its own color below.
@@ -8354,6 +8430,20 @@ inline bool ProcessInlinePreSR(
     return false;
   }
   if (commands_recorded != nullptr) *commands_recorded = true;
+  if (evaluation::active != nullptr) evaluation::active->recorded = true;
+  if (crop_color) {
+    // NGX DLSS programming guide 3.4: game inputs enter and leave evaluate
+    // in NON_PIXEL_SHADER_RESOURCE. The private stand-in may be readable by both stages.
+    Transition(command_list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(command_list, res.original, res.original_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    CopyRect(command_list, res.original, color, color_rect);
+    Transition(command_list, res.original, D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    res.original_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Transition(command_list, color, D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
 
   EvaluationContract frame;
   frame.source_handle = handle;
@@ -8364,8 +8454,10 @@ inline bool ProcessInlinePreSR(
   // subrect at the working dims and the guide subrects at the full surface,
   // and the game's MVecScale is corrected by the applied fraction (same
   // guide/color arrangement as the after path).
-  frame.input_width = width;
-  frame.input_height = height;
+  frame.input_width = current.input_width;
+  frame.input_height = current.input_height;
+  frame.motion_width = resolved.motion_width;
+  frame.motion_height = resolved.motion_height;
   frame.output_width = width;
   frame.output_height = height;
   frame.motion_x = current.motion_x;
@@ -8410,7 +8502,7 @@ inline bool ProcessInlinePreSR(
     // rebind discipline as the SDR pass-0 reference) becomes the whole-frame
     // linear working copy work0 - the metering input, the pedestal
     // reference, and pass 0's encode source.
-    SetSourceView(device, res, color, kDescriptorLinearizeSet);
+    SetSourceView(device, res, pipeline_color, kDescriptorLinearizeSet);
     Transition(
         command_list,
         res.work0,
@@ -8484,7 +8576,7 @@ inline bool ProcessInlinePreSR(
         res.hdr_mode != 0
             ? (pass == 0 ? res.work0
                          : ((pass & 1) != 0 ? res.work_a : res.work_b))
-            : (pass == 0 ? color : stack_surfaces[(pass - 1) & 1]);
+            : (pass == 0 ? pipeline_color : stack_surfaces[(pass - 1) & 1]);
     // Pass 0 reads the game's color on SDR, which pre-SR never state-tracks
     // (NGX reads it as an SRV by contract); every other surface is tracked.
     D3D12_RESOURCE_STATES* const ref_state =
@@ -8579,16 +8671,16 @@ inline bool ProcessInlinePreSR(
       // may still be in flight.  The decode restores the pre-NR reference's
       // alpha from t3.  (HDR instead rebinds the LINEARIZE set's source once
       // per frame, before the loop - pass 0's encode reads work0.)
-      SetSourceView(device, res, color, 0);
-      SetSourceView(device, res, color, 3);
+      SetSourceView(device, res, pipeline_color, 0);
+      SetSourceView(device, res, pipeline_color, 3);
       // The look and transport sets carry the same reference slots.
       if ((res.look_surfaces & kLookSurfaceOutput) != 0) {
-        SetSourceView(device, res, color, kDescriptorLookSet);
-        SetSourceView(device, res, color, kDescriptorLookSet + 3);
+        SetSourceView(device, res, pipeline_color, kDescriptorLookSet);
+        SetSourceView(device, res, pipeline_color, kDescriptorLookSet + 3);
       }
       if ((res.look_surfaces & kLookSurfaceTransport) != 0) {
-        SetSourceView(device, res, color, kDescriptorTransportSet);
-        SetSourceView(device, res, color, kDescriptorTransportSet + 3);
+        SetSourceView(device, res, pipeline_color, kDescriptorTransportSet);
+        SetSourceView(device, res, pipeline_color, kDescriptorTransportSet + 3);
       }
     }
     if (ref_state != nullptr) {
@@ -8719,6 +8811,10 @@ inline bool ProcessInlinePreSR(
       }
     }
     last_result = static_cast<uint32_t>(nr_result);
+    if (evaluation::active) {
+      evaluation::active->nr_result = static_cast<uint32_t>(nr_result);
+      ++evaluation::active->nr_calls;
+    }
     if (NVSDK_NGX_FAILED(nr_result)) {
       stack_failure = nr_result;
       failed_pass = pass;
@@ -8853,6 +8949,8 @@ inline bool ProcessInlinePreSR(
       feature.slots[later].pending_reset = true;
     }
     std::ostringstream message;
+    evaluation::Note(evaluation::Outcome::kNrFailed);
+    if (evaluation::active != nullptr) evaluation::active->nr_result = static_cast<uint32_t>(stack_failure);
     message << "pre-SR feature 18 evaluate failed with 0x" << std::hex
             << static_cast<uint32_t>(stack_failure)
             << " (stack pass " << (failed_pass + 1) << '/' << requested_stack
@@ -8977,7 +9075,7 @@ inline bool ProcessInlinePreSR(
         height,
         frame_divisor,
         v6_pedestal_cap,
-        final_pass_transfer,
+        FramePedestalStrength(final_pass_transfer),
         final_pass_color,
         v6_encoding,
         v6_dark_gate,
@@ -9015,7 +9113,19 @@ inline bool ProcessInlinePreSR(
       res.pre_sr_color,
       res.pre_sr_color_state,
       D3D12_RESOURCE_STATE_COPY_DEST);
-  CopyMip0(command_list, res.pre_sr_color, final_surface);
+  if (crop_color) {
+    // Retain the game's allocation and subrect coordinates, including all
+    // pixels and alpha outside the enhanced window. No metadata is rewritten.
+    // NGX DLSS programming guide 3.4: game inputs enter and leave evaluate
+    // in NON_PIXEL_SHADER_RESOURCE. The private stand-in may be readable by both stages.
+    Transition(command_list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    CopyMip0(command_list, res.pre_sr_color, color);
+    Transition(command_list, color, D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  CopyRect(command_list, res.pre_sr_color, final_surface, {0, 0, width, height},
+           color_rect.x, color_rect.y);
   Transition(
       command_list,
       res.pre_sr_color,
@@ -9074,6 +9184,9 @@ inline bool ProcessInlinePreSR(
     return true;
   }
   for (auto& slot : feature.slots) slot.fail_count = 0;
+  evaluation::Completed(evaluation::active != nullptr
+      && evaluation::active->route == evaluation::Route::kBridgeBefore
+          ? evaluation::Route::kBridgeBefore : evaluation::Route::kBefore);
   const uint64_t count = ++successful_pre_sr_evaluations;
   streamline_escalation_deficits.store(0, std::memory_order_relaxed);
   last_input_width = nr_input_width;
@@ -9115,7 +9228,18 @@ inline bool ProcessStreamlineInline(
       || (nr_before_upscale.load() && streamline_feature != sl::kFeatureDLSS_RR)
       || command_list == nullptr
       || !IsSupportedInjectionCommandList(command_list)) {
+    evaluation::Note(!enabled.load() ? evaluation::Outcome::kDisabled : evaluation::Outcome::kRouteUnavailable);
     return false;
+  }
+  if (evaluation::active) {
+    evaluation::active->route = evaluation::Route::kStreamline;
+    evaluation::active->source_api = 3;
+    const ID3D12Resource* resources[] = {capture.color.resource, capture.output.resource,
+        capture.motion.resource, capture.depth.resource, nullptr};
+    for (size_t i = 0; i < 5; ++i) {
+      evaluation::active->source[i] = ContractResource(const_cast<ID3D12Resource*>(resources[i]));
+      if (resources[i] == nullptr && i < 4) evaluation::active->missing_inputs |= 1u << i;
+    }
   }
   if (capture.color.resource == nullptr
       || capture.output.resource == nullptr || capture.motion.resource == nullptr
@@ -9158,7 +9282,11 @@ inline bool ProcessStreamlineInline(
   NVSDK_NGX_Parameter* parameters = nullptr;
   const NVSDK_NGX_Result allocate_result = core_allocate_parameters(&parameters);
   last_result = static_cast<uint32_t>(allocate_result);
-  if (NVSDK_NGX_FAILED(allocate_result) || parameters == nullptr) return false;
+  if (NVSDK_NGX_FAILED(allocate_result) || parameters == nullptr) {
+    evaluation::Note(evaluation::Outcome::kNrFailed);
+    if (evaluation::active) evaluation::active->nr_result = static_cast<uint32_t>(allocate_result);
+    return false;
+  }
 
   const auto desc_for = [](const StreamlineResourceRef& resource) {
     return resource.resource->GetDesc();
@@ -9183,6 +9311,7 @@ inline bool ProcessStreamlineInline(
       || output_desc.SampleDesc.Count != 1) {
     core_destroy_parameters(parameters);
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    evaluation::Note(evaluation::Outcome::kDeviceUnavailable);
     return false;
   }
 
@@ -9277,6 +9406,7 @@ inline bool ProcessStreamlineInline(
   synthetic_handles.insert(&synthetic_handle_storage);
   auto [entry, inserted] = features.try_emplace(synthetic_handle);
   if (inserted) {
+    entry->second.source_generation = ++next_source_generation;
     entry->second.source_feature = streamline_feature == sl::kFeatureDLSS_RR
         ? kFeatureDlssd
         : kFeatureDlss;
@@ -9325,6 +9455,36 @@ inline bool KnownHandleFeature(
   return false;
 }
 
+// Caller holds runtime_mutex. A D3D11 caller uses the resource-free adapter;
+// its original descriptors are collected with the D3D11 API in the bridge.
+inline void CaptureGameEvaluation(const NVSDK_NGX_Handle* handle,
+                                  const NVSDK_NGX_Parameter* parameters, bool native12) {
+  if (evaluation::active == nullptr || InsideDirectCall() || parameters == nullptr) return;
+  auto& record = *evaluation::active;
+  record.source_api = native12 ? 1 : 2;
+  if (!record.raw_available) { record.raw = contract::Read(parameters); record.raw_available = true; }
+  NVSDK_NGX_Feature feature;
+  if (KnownHandleFeature(handle, &feature)) {
+    record.feature = static_cast<uint32_t>(feature);
+    record.eligibility = feature == kFeatureDlss || feature == kFeatureDlssd ? 1 : 2;
+  }
+  if (const auto entry = create_contracts.find(handle); entry != create_contracts.end()) {
+    record.create_seen = entry->second.create_observed;
+    record.generation = entry->second.source_generation;
+    record.captured = entry->second.source_contract;
+  }
+  record.device_generation = direct_device_generation;
+  // Do not interpret resource keys of an unrelated feature (e.g. frame generation).
+  if (record.eligibility == 2 || !native12) return;
+  const char* keys[] = {NVSDK_NGX_Parameter_Color, NVSDK_NGX_Parameter_Output,
+      NVSDK_NGX_Parameter_MotionVectors, NVSDK_NGX_Parameter_Depth, NVSDK_NGX_Parameter_ExposureTexture};
+  for (size_t i = 0; i < record.source.size(); ++i) {
+    auto* resource = GetD3D12Resource(parameters, keys[i]);
+    record.source[i] = ContractResource(resource);
+    if (resource == nullptr && i < 4) record.missing_inputs |= 1u << i;
+  }
+}
+
 inline bool RegisteredDlssEvaluate(const NVSDK_NGX_Handle* handle) {
   NVSDK_NGX_Feature feature = kFeatureDlss;
   if (!KnownHandleFeature(handle, &feature) || feature == kFeatureDlss
@@ -9354,7 +9514,7 @@ inline bool RegisteredDlssEvaluate(const NVSDK_NGX_Handle* handle) {
 // before.  Caller must hold runtime_mutex.
 inline std::atomic_bool logged_pre_sr_rr = false;
 inline bool PreSrTakes(const NVSDK_NGX_Handle* handle) {
-  if (!nr_before_upscale.load()) return false;
+  if (!(evaluation::active ? evaluation::active->before_selected : nr_before_upscale.load())) return false;
   NVSDK_NGX_Feature feature = kFeatureDlss;
   if (!KnownHandleFeature(handle, &feature) || feature != kFeatureDlssd) return true;
   if (!logged_pre_sr_rr.exchange(true)) {
@@ -9463,6 +9623,8 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   if (feature != kFeatureDlss && feature != kFeatureDlssd) return;
   FeatureState state = DeriveFeatureState(parameters);
   state.source_feature = feature;
+  state.create_observed = true;
+  state.source_generation = ++next_source_generation;
   create_contracts[handle] = state;
   features[handle] = state;
 }
@@ -11684,7 +11846,7 @@ inline NVSDK_NGX_Result PassSourceOther(Real&& real) {
   inside_game_evaluate_wrapper = true;
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
-    return real();
+    return evaluation::Return(real());
   }();
   inside_game_evaluate_wrapper = outer;
   return result;
@@ -11697,13 +11859,18 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback callback) {
   debug::TouchNgxEval();
+  evaluation::Scope evaluation_scope(!InsideDirectCall(), handle, enabled.load(),
+      nr_before_upscale.load(), nr_before_upscale.load()
+          ? evaluation::Route::kBefore : evaluation::Route::kAfter,
+      {guide_contract_mode.load(), output_rect_mode.load(), input_rect_mode.load()});
   ngx_entry_evaluate[Slot].fetch_add(1, std::memory_order_relaxed);
   auto real = reinterpret_cast<decltype(&NVSDK_NGX_D3D12_EvaluateFeature)>(
       ngx_slot_real[Slot].evaluate);
   CallbackScope callback_scope;
   if (!callback_scope) {
+    evaluation::Note(evaluation::Outcome::kLifecycleInactive);
     const NgxRuntimeCommandScope runtime_scope;
-    return real(command_list, handle, parameters, callback);
+    return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
   }
   // A-1: everything below dereferences command_list (the foreign installs,
   // the pre-SR hooks, the state envelope, the NR pass).  A first argument
@@ -11716,13 +11883,13 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     ++intercepted_evaluations;
     CountNrDecline(NrDeclineReason::kImplausibleArgument);
     const NgxRuntimeCommandScope runtime_scope;
-    return real(command_list, handle, parameters, callback);
+    return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
   }
   // The native D3D11 route: a tool's D3D12 evaluate is not ours to inject.
   if (!InsideDirectCall() && !inside_game_evaluate_wrapper
       && ForeignD3D12SourceIgnored()) {
     return PassSourceOther(
-        [&] { return real(command_list, handle, parameters, callback); });
+        [&] { return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall()); });
   }
   const EvaluateChainScope chain_scope;
   const bool nested_in_c_wrapper = inside_game_evaluate_wrapper;
@@ -11772,6 +11939,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   PreSrSwap pre_sr;
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
+    CaptureGameEvaluation(handle, parameters, true);
     if (enabled.load()
         && handle != nullptr && parameters != nullptr
         && PreSrTakes(handle) && !NrYieldsToForeign()
@@ -11810,7 +11978,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
-    return real(command_list, handle, parameters, callback);
+    return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
   }();
   state_envelope.StopCapture();
   RestorePreSrColor(parameters, pre_sr);
@@ -11825,7 +11993,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     return result;
   }
   if (NVSDK_NGX_FAILED(result)) {
-    CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
+    // Pre-SR already named its NR terminal; the game's result is separate.
+    if (!evaluation::active || evaluation::active->outcome == evaluation::Outcome::kUnexplained)
+      CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
   }
   if (!enabled.load()) {
@@ -11857,7 +12027,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kTeardownPending);
     return result;
   }
-  if (PreSrTakes(handle)) return result;
+  if (PreSrTakes(handle)) {
+    evaluation::Note(evaluation::Outcome::kHooksUnavailable);
+    return result;
+  }
   // Without a complete restore target the injected binds would be the last
   // thing the game records against - the bindless-engine device-removal
   // class.  Decline the frame instead of polluting it (the game's own image
@@ -11891,13 +12064,18 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback_C callback) {
   debug::TouchNgxEval();
+  evaluation::Scope evaluation_scope(!InsideDirectCall(), handle, enabled.load(),
+      nr_before_upscale.load(), nr_before_upscale.load()
+          ? evaluation::Route::kBefore : evaluation::Route::kAfter,
+      {guide_contract_mode.load(), output_rect_mode.load(), input_rect_mode.load()});
   ngx_entry_evaluate_c[Slot].fetch_add(1, std::memory_order_relaxed);
   auto real = reinterpret_cast<decltype(&NVSDK_NGX_D3D12_EvaluateFeature_C)>(
       ngx_slot_real[Slot].evaluate_c);
   CallbackScope callback_scope;
   if (!callback_scope) {
+    evaluation::Note(evaluation::Outcome::kLifecycleInactive);
     const NgxRuntimeCommandScope runtime_scope;
-    return real(command_list, handle, parameters, callback);
+    return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
   }
   // A-1: as in the C++ wrapper.  The flag stays raised across real() so a
   // C++ evaluate the C export delegates to takes its nested path, which
@@ -11910,14 +12088,14 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     inside_game_evaluate_wrapper = true;
     const NVSDK_NGX_Result result = [&] {
       const NgxRuntimeCommandScope runtime_scope;
-      return real(command_list, handle, parameters, callback);
+      return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
     }();
     inside_game_evaluate_wrapper = false;
     return result;
   }
   if (!InsideDirectCall() && ForeignD3D12SourceIgnored()) {
     return PassSourceOther(
-        [&] { return real(command_list, handle, parameters, callback); });
+        [&] { return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall()); });
   }
   const EvaluateChainScope chain_scope;
   const EvaluateInFlightScope in_flight(true);
@@ -11941,6 +12119,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   PreSrSwap pre_sr;
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
+    CaptureGameEvaluation(handle, parameters, true);
     if (enabled.load()
         && handle != nullptr && parameters != nullptr
         && PreSrTakes(handle) && !NrYieldsToForeign()
@@ -11968,18 +12147,32 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
       InsideDirectCall() ? nullptr : command_list);
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
-    return real(command_list, handle, parameters, callback);
+    return evaluation::Return(real(command_list, handle, parameters, callback), !InsideDirectCall());
   }();
   inside_game_evaluate_wrapper = false;
   state_envelope.StopCapture();
   RestorePreSrColor(parameters, pre_sr);
-  if (InsideDirectCall() || NVSDK_NGX_FAILED(result) || !enabled.load()
-      || handle == nullptr || parameters == nullptr) {
+  if (InsideDirectCall()) return result;
+  if (NVSDK_NGX_FAILED(result)) {
+    // Pre-SR already named its NR terminal; the game's result is separate.
+    if (!evaluation::active || evaluation::active->outcome == evaluation::Outcome::kUnexplained)
+      CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
+    return result;
+  }
+  if (!enabled.load()) {
+    CountNrDecline(NrDeclineReason::kNrDisabledEvaluation);
+    return result;
+  }
+  if (handle == nullptr || parameters == nullptr) {
+    CountNrDecline(NrDeclineReason::kMalformedEvaluate);
     return result;
   }
 
   RuntimeLock lock(runtime_mutex);
-  if (!RegisteredDlssEvaluate(handle)) return result;
+  if (!RegisteredDlssEvaluate(handle)) {
+    CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
+    return result;
+  }
   if (NrYieldsToForeign()) {
     CountNrDecline(NrDeclineReason::kForeignNr);
     return result;
@@ -11988,7 +12181,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     CountNrDecline(NrDeclineReason::kTeardownPending);
     return result;
   }
-  if (PreSrTakes(handle)) return result;
+  if (PreSrTakes(handle)) {
+    evaluation::Note(evaluation::Outcome::kHooksUnavailable);
+    return result;
+  }
   if (!state_envelope.Admit(
           "after-upscale, C export", NrDeclineReason::kStateShadowUnavailable,
           &logged_state_shadow_skip_c)) {
@@ -12654,14 +12850,23 @@ inline sl::Result HookedStreamlineEvaluate(
     uint32_t num_inputs,
     sl::CommandBuffer* command_buffer) {
   CallbackScope callback_scope;
+  const bool internal = callback_scope && StreamlineInternalCallback();
+  evaluation::Scope evaluation_scope(!internal, nullptr, enabled.load(), nr_before_upscale.load(),
+      evaluation::Route::kStreamline, {guide_contract_mode.load(), output_rect_mode.load(), input_rect_mode.load()});
+  if (!internal && evaluation::active != nullptr) {
+    evaluation::active->feature = feature == sl::kFeatureDLSS ? static_cast<uint32_t>(kFeatureDlss)
+        : feature == sl::kFeatureDLSS_RR ? static_cast<uint32_t>(kFeatureDlssd) : ~0u;
+    evaluation::active->eligibility = feature == sl::kFeatureDLSS || feature == sl::kFeatureDLSS_RR ? 1 : 2;
+  }
+  if (!callback_scope) evaluation::Note(evaluation::Outcome::kLifecycleInactive);
   // ENV-02: SL owns the proxy/native choice. Forward its original buffer;
   // unwrapping before the real call breaks another interposer's contract.
-  if (!callback_scope || StreamlineInternalCallback()
+  if (!callback_scope || internal
       || real_streamline_evaluate == nullptr) {
-    return real_streamline_evaluate != nullptr
-        ? real_streamline_evaluate(
-              feature, frame, inputs, num_inputs, command_buffer)
-        : sl::Result::eErrorInvalidParameter;
+    if (real_streamline_evaluate == nullptr) evaluation::Note(evaluation::Outcome::kHooksUnavailable);
+    return evaluation::Return(real_streamline_evaluate != nullptr
+        ? real_streamline_evaluate(feature, frame, inputs, num_inputs, command_buffer)
+        : sl::Result::eErrorInvalidParameter, !internal);
   }
   const EvaluateChainScope chain_scope;
   ++intercepted_streamline_evaluations;
@@ -12671,6 +12876,11 @@ inline sl::Result HookedStreamlineEvaluate(
   const uint64_t nr_before = successful_evaluations.load();
   const sl::Result result = real_streamline_evaluate(
       feature, frame, inputs, num_inputs, command_buffer);
+  evaluation::GameReturned(static_cast<uint32_t>(result));
+  if (result != sl::Result::eOk) evaluation::Note(evaluation::Outcome::kGameFailed);
+  else if (feature != sl::kFeatureDLSS && feature != sl::kFeatureDLSS_RR)
+    evaluation::Note(evaluation::Outcome::kExcluded);
+  else if (NrYieldsToForeign()) evaluation::Note(evaluation::Outcome::kExcluded);
   if (result != sl::Result::eOk
       || (feature != sl::kFeatureDLSS && feature != sl::kFeatureDLSS_RR)
       || NrYieldsToForeign()
@@ -12684,11 +12894,12 @@ inline sl::Result HookedStreamlineEvaluate(
     return result;
   }
 
-  if (command_buffer == nullptr) return result;
+  if (command_buffer == nullptr) { evaluation::Note(evaluation::Outcome::kListUnsupported); return result; }
   auto* unknown = reinterpret_cast<IUnknown*>(command_buffer);
   ID3D12GraphicsCommandList* command_list = nullptr;
   if (FAILED(unknown->QueryInterface(IID_PPV_ARGS(&command_list)))
       || command_list == nullptr) {
+    evaluation::Note(evaluation::Outcome::kListUnsupported);
     return result;
   }
   // Loader work before the lock, as on the NGX evaluate paths.
@@ -13646,6 +13857,15 @@ inline std::atomic_bool card_partial_latched{false};
 inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
                                         int64_t now_ns) {
   ui::CardInputs in;
+  evaluation::Record recent;
+  if (evaluation::ReadLatest(&recent)) {
+    in.recent_state = now_ns - recent.completed_ns > 2'000'000'000LL ? 3
+        : recent.outcome == evaluation::Outcome::kCompleted ? 1 : 2;
+    in.recent_retry = recent.outcome == evaluation::Outcome::kRetry;
+    in.recent_before = recent.route == evaluation::Route::kBefore || recent.route == evaluation::Route::kBridgeBefore;
+  } else if (evaluation::latest_relevant_sequence.load(std::memory_order_relaxed) != 0) {
+    in.recent_state = 3;  // The bounded detail was overwritten or unavailable.
+  }
   in.partial_latched = card_partial_latched.load(std::memory_order_relaxed);
   in.verdict = verdict;
   in.dlss_hint = dlss_user_hint.load(std::memory_order_relaxed);
@@ -13666,6 +13886,7 @@ inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
   in.input_height = last_input_height.load(std::memory_order_relaxed);
   in.output_width = last_output_width.load(std::memory_order_relaxed);
   in.output_height = last_output_height.load(std::memory_order_relaxed);
+  if (in.recent_state == 1) in.pre_sr = in.recent_before;
   return in;
 }
 
@@ -14398,6 +14619,16 @@ inline void RunLifecycleTick(int64_t present_ns) {
     // for six releases.  A present-rate check of ~20 relaxed loads.
     const NrVerdict verdict = MaybeEmitNrVerdict();
     const int64_t tick_ns = SteadyNowNs();
+    static int64_t ledger_logged_ns = 0;
+    static uint64_t ledger_logged_finished = 0;
+    if (tick_ns - ledger_logged_ns >= 1'000'000'000LL) {
+      const auto totals = evaluation::ReadTotals();
+      if (totals.finished != ledger_logged_finished) {
+        Log(reshade::log::level::info, "NR-EVAL v1 " + evaluation::TotalsJson(totals));
+        ledger_logged_finished = totals.finished;
+      }
+      ledger_logged_ns = tick_ns;
+    }
     if (!enabled.load(std::memory_order_relaxed)) {
       nr_on_since_ns.store(0, std::memory_order_relaxed);
     } else if (nr_on_since_ns.load(std::memory_order_relaxed) == 0) {
@@ -15033,11 +15264,17 @@ inline constexpr Setting kSetLookUpsample{
 // transfer mode, the neural-floor guard - v6_common's ChromaClampStops,
 // TransferMode and Curve 2) apply on the next frame, as the transfer and
 // colour strengths always did.
+inline constexpr Setting kSetGuideContract{
+    "NRGuideContract", &guide_contract_mode, 0u, SettingEffect::kRecreate};
+inline constexpr Setting kSetOutputRect{
+    "NROutputRect", &output_rect_mode, 0u, SettingEffect::kRecreate};
+inline constexpr Setting kSetInputRect{
+    "NRInputRect", &input_rect_mode, 0u, SettingEffect::kRecreate};
 inline constexpr Setting kSetCodecMode{
     "NRCodecMode", &codec_mode, defaults::kCodecMode, SettingEffect::kHistory};
 inline constexpr Setting kSetProxyAnchor{
     "NRProxyAnchor", &proxy_anchor_nits, defaults::kProxyAnchorNits,
-    SettingEffect::kNone};
+    SettingEffect::kHistory};
 inline constexpr Setting kSetSourceEncoding{
     "NRSourceEncoding", &source_encoding, defaults::kSourceEncoding,
     SettingEffect::kRecreate};
@@ -15052,7 +15289,7 @@ inline constexpr Setting kSetPqCalibration{
     SettingEffect::kHistory};
 inline constexpr Setting kSetDiffuseWhite{
     "NRDiffuseWhiteNits", &diffuse_white_nits, defaults::kDiffuseWhiteNits,
-    SettingEffect::kNone};
+    SettingEffect::kHistory};
 inline constexpr Setting kSetPaperWhiteScale{
     "NRPaperWhiteScale", &paper_white_scale, defaults::kPaperWhiteScale,
     SettingEffect::kHistory};
@@ -15068,6 +15305,9 @@ inline constexpr Setting kSetTransferMode{
     "NRTransferMode", &transfer_mode, defaults::kTransferMode, SettingEffect::kNone};
 inline constexpr Setting kSetDisplayPedestal{
     "NRDisplayPedestal", &display_pedestal, defaults::kDisplayPedestal,
+    SettingEffect::kNone};
+inline constexpr Setting kSetPedestalStrength{
+    "NRPedestalStrength", &pedestal_strength, defaults::kPedestalStrength,
     SettingEffect::kNone};
 inline constexpr Setting kSetNeuralFloorGuard{
     "NRNeuralFloorGuard", &neural_floor_guard, defaults::kNeuralFloorGuard,
@@ -15135,11 +15375,12 @@ inline constexpr const Setting* kHotkeySettings[] = {
     &kSetScreenshotJpegQuality, &kSetScreenshotMaxMB};
 inline constexpr const Setting* kDiagnosticsSettings[] = {&kSetGpuTimers, &kSetEditTrace};
 inline constexpr const Setting* kFixesSettings[] = {
+    &kSetGuideContract, &kSetOutputRect, &kSetInputRect,
     &kSetCodecMode,       &kSetProxyAnchor,      &kSetSourceEncoding,
     &kSetLinearUnitNits,  &kSetSourcePrimaries,  &kSetPqCalibration,
     &kSetDiffuseWhite,    &kSetPaperWhiteScale,  &kSetTransferStrength,
     &kSetColorStrength,   &kSetChromaClamp,      &kSetTransferMode,
-    &kSetDisplayPedestal, &kSetNeuralFloorGuard, &kSetFeedMode,
+    &kSetDisplayPedestal, &kSetPedestalStrength, &kSetNeuralFloorGuard, &kSetFeedMode,
     &kSetNormGovernor,    &kSetNormAttack,       &kSetNormRelease,
     &kSetNormSlew,        &kSetDepthMode,        &kSetMvecScaleX,
     &kSetMvecScaleY,      &kSetChainedHistory};
@@ -15433,7 +15674,7 @@ inline void DrawSectionNrCore(const ui::PanelText& text) {
   // Overall Intensity is primary (v5.3 UI policy): master strength of the
   // neural pass belongs next to the enable switch, not under styling.
   ImGui::BeginDisabled(ui_defaults_view);
-  SliderSetting(text, kSetIntensity, text.intensity, 0.f, 2.f, "%.2f",
+  SliderSetting(text, kSetIntensity, stack_passes.load() > 1 ? "Pass 1 strength" : text.intensity, 0.f, 2.f, "%.2f",
                 ui::text::kIntensityTip);
   ImGui::EndDisabled();
 }
@@ -15757,17 +15998,18 @@ inline void DrawSectionStackingResolution(const ui::PanelText& text) {
     const bool transfer_inert = transfer_strength_inert.load(std::memory_order_relaxed);
     ImGui::BeginDisabled(transfer_inert);
     SliderSetting(text, kSetPassTransfer[pass - 1],
-                  text.Pick("HDR Transfer Strength", "HDR transfer"), 0.f, 1.f, "%.2f",
+                  text.Pick("HDR Transfer Strength",
+          last_frame_display_codec.load() ? "Legacy pedestal strength" : "Enhancement strength"), 0.f, 1.f, "%.2f",
                   transfer_inert ? ui::text::kTransferInertTip
-                  : text.modern  ? ui::text::kTransferTip
-                                 : nullptr);
+                                 : ui::text::kTransferTip);
     ImGui::EndDisabled();
-    SliderSetting(text, kSetPassColor[pass - 1], text.Pick("Color Strength", "Color"),
-                  0.f, 1.f, "%.2f", text.modern ? ui::text::kColorTip : nullptr);
+    SliderSetting(text, kSetPassColor[pass - 1], text.Pick("Color Strength",
+          last_frame_display_codec.load() ? "Enhancement strength" : "Colour transfer"),
+                  0.f, 1.f, "%.2f", ui::text::kColorTip);
     ToggleSetting(
         text, kSetPassFollow[pass - 1], "Same as pass 1",
-        "This pass steers the model with pass 1's Look settings.  Off gives it"
-        " its own, below.");
+        "Copies pass 1's six model-steering controls. Strength, enhancement"
+        " transfer and colour transfer remain independent for every pass.");
     if (!pass_follow[pass - 1].load()) DrawModelSteering(text, pass);
     ImGui::PopID();
   }
@@ -15901,15 +16143,23 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
   // v6 normalization is intentionally not a user-tunable state machine.
   // Relative HDR is normalized from the current frame on the GPU; calibrated
   // absolute HDR uses its fixed source-unit contract.
+  bool have_workset = false;
   bool have_hdr_workset = false;
+  bool ui_display = false;
+  bool ui_meter = false;
   codec::SourceUnits ui_units = {};
   {
     RuntimeLock lock(runtime_mutex);
+    const FinalResources* latest = nullptr;
     for (const auto& [_, res] : worksets) {
-      if (res.hdr_mode == 0) continue;
-      have_hdr_workset = true;
-      ui_units = res.units;
-      break;
+      if (latest == nullptr || res.last_used_ns > latest->last_used_ns) latest = &res;
+    }
+    if (latest != nullptr) {
+      have_workset = true;
+      have_hdr_workset = latest->hdr_mode != 0;
+      ui_units = latest->units;
+      ui_display = FrameDisplayCodec(*latest);
+      ui_meter = have_hdr_workset && !ui_units.absolute && latest->norm_feed == FeedSource::kV1;
     }
   }
   if (have_hdr_workset) {
@@ -15920,25 +16170,30 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
           text.Tr(text.Pick("Normalization: fixed calibrated source (%.0f nits per unit).",
                             "fixed, %.0f nits per unit")),
           ui_units.unit_nits);
+    } else if (!ui_meter) {
+      ImGui::TextUnformatted(text.Tr("Game exposure; normalization governor inactive"));
     } else {
       ImGui::Text(
           text.Tr(text.Pick("Normalization: same-frame GPU autoscale, governor %s.",
                             "GPU autoscale, governor %s")),
-          text.Tr(norm_governor.load() == 0u ? "off (raw candidate)" : "slew"));
+          text.Tr(norm_governor.load() == 0u ? "off (raw candidate)"
+              : norm_governor.load() == 1u ? "slew" : "stable"));
     }
   }
   if (current_codec == 1u || current_codec == 3u) {
+    ImGui::BeginDisabled(have_workset && (!have_hdr_workset || !ui_units.absolute
+        || (ui_display && ui_units.encoding == codec::Encoding::Pq)));
     SliderSetting(
         text, kSetProxyAnchor, text.Pick("Proxy Anchor (nits)", "Proxy anchor (nits)"),
         0.5f, 32.f, text.Pick("%.1f nits", "%.1f"),
         "Used only for calibrated absolute HDR. Relative HDR uses the current"
         " frame's GPU-derived scale.");
+    ImGui::EndDisabled();
   }
   if (ImGui::TreeNodeEx(
           "source_interpretation", 0, "%s",
           text.Tr(text.Pick("Source interpretation (advanced)", "Source interpretation")))) {
-    // Overrides are for mis-declaring engines only; Auto reads the swapchain
-    // format evidence.
+    // Auto combines the NGX HDR declaration with the evaluated image format.
     constexpr const char* kSourceEncodings[] = {
         "Auto (format evidence)",
         "SDR / relative",
@@ -15946,70 +16201,75 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
         "PQ / 10,000 nits"};
     ChoiceSetting(text, kSetSourceEncoding, text.Pick("Source Encoding", "Encoding"),
                   kSourceEncodings,
-                  text.modern ? "What the game's image is.  Auto reads it from the"
-                                " image format; override only an engine that"
-                                " declares its format wrongly."
-                              : nullptr);
+                  "Auto uses the image format and the game's NGX HDR declaration."
+                  " Override only when that evidence misidentifies the source.");
+    ImGui::BeginDisabled(have_workset && ui_units.encoding != codec::Encoding::Linear);
     SliderSetting(
         text, kSetLinearUnitNits, text.Pick("Linear Unit (nits)", "Linear unit (nits)"),
         0.f, 10000.f, "%.0f",
         "Nits per 1.0 of a linear source: 0 keeps it relative (GPU autoscale); a"
         " positive value marks it calibrated/absolute.");
+    ImGui::EndDisabled();
     constexpr const char* kSourcePrimaries[] = {
         "Auto", "BT.709", "BT.2020", "AP1 (ACEScg)"};
     ChoiceSetting(
-        text, kSetSourcePrimaries, text.Pick("Source Primaries", "Primaries"),
+        text, kSetSourcePrimaries, text.Pick("Source Primaries", "Primaries (metadata)"),
         kSourcePrimaries,
-        "Advisory label only - the neural model works in wide gamut and no"
-        " conversion is applied.");
+        "Metadata only. This does not convert the image's colour primaries.");
+    ImGui::BeginDisabled(have_workset && (!have_hdr_workset
+        || ui_units.encoding != codec::Encoding::Pq || ui_display || current_codec == 1u));
     SliderSetting(
         text, kSetPqCalibration, text.Pick("PQ Calibration", "PQ calibration"), 0.005f,
         16.f, "%.4f",
         "Extra scene-linear gain for PQ sources (classic and Auto over"
         " absolute units).  1 = the 203-nit BT.2408 reference; the pre-v6"
         " default was 2.5375 and migrated configs keep it.");
+    ImGui::EndDisabled();
     ImGui::TreePop();
   }
+  ImGui::BeginDisabled(have_workset && (!have_hdr_workset
+      || ui_units.encoding != codec::Encoding::Pq || current_codec == 1u));
   SliderSetting(
       text, kSetDiffuseWhite, text.diffuse_white, 80.f, 1000.f, "%.0f",
-      text.Pick("PQ HDR bridge anchor: the nit level treated as diffuse white"
-                " (BT.2408 reference is 203).  Ignored on the SDR path; the"
-                " linear HDR path uses Paper-White Scale instead.",
-                ui::text::kPaperWhiteTip));
+      ui::text::kPaperWhiteTip);
+  ImGui::EndDisabled();
+  ImGui::BeginDisabled(have_workset && (!have_hdr_workset || !ui_units.absolute
+      || ui_display || current_codec == 1u));
   SliderSetting(
       text, kSetPaperWhiteScale,
       text.Pick("Scene Paper-White Scale", "Scene white scale"), 0.005f, 16.f, "%.3f",
-      text.Pick("Classic and Auto-over-linear codec gain (2.5375 = 203-nit"
-                " diffuse white); PQ sources use Diffuse White and PQ"
-                " Calibration instead.",
-                ui::text::kSceneWhiteTip));
-  constexpr const char* kDisplayPedestals[] = {"Auto (recommended)", "Always"};
+      ui::text::kSceneWhiteTip);
+  ImGui::EndDisabled();
+  constexpr const char* kDisplayPedestals[] = {
+      "Legacy Auto", "Legacy Always", "Off", "Auto (recommended)", "On (independent)"};
+  ImGui::BeginDisabled(have_workset && !have_hdr_workset);
   ChoiceSetting(
       text, kSetDisplayPedestal, "Dark pedestal removal", kDisplayPedestals,
-      "Float-HDR games: whether the dark lift the model adds in near-black"
-      " areas is removed; HDR Transfer Strength sets how much.  Auto skips"
-      " the removal where the game's brightness is relative (Kingdom Come"
-      " Deliverance II, Alan Wake 2, GTA V): there it reads shadow noise as a"
-      " lift and darkens shadows block by block, which flickers.  Always"
-      " removes it in every HDR game, as releases up to rc7 did.");
-  // While the evaluated frame skips the removal, HDR Transfer Strength has
-  // nothing to scale: greyed out with the reason as its tooltip, the value
-  // still shown.
+      "Auto skips subtraction on PQ and relative Display HDR. Other inputs keep"
+      " the legacy rule. Off preserves the neural result without subtraction."
+      " On uses the independent strength below. Legacy modes follow HDR transfer.");
+  ImGui::EndDisabled();
+  ImGui::BeginDisabled(display_pedestal.load() != 4u || (have_workset && !have_hdr_workset));
+  SliderSetting(text, kSetPedestalStrength, "Pedestal strength", 0.f, 1.f, "%.2f",
+      "Amount of dark-pedestal subtraction, independent of enhancement strength.");
+  ImGui::EndDisabled();
+  // Display uses this legacy slider only for pedestal subtraction. Divisor
+  // codecs still use it for the complete neural edit, even with pedestal Off.
   const bool transfer_inert = transfer_strength_inert.load(std::memory_order_relaxed);
   ImGui::BeginDisabled(transfer_inert);
   SliderSetting(
-      text, kSetTransferStrength, text.Pick("HDR Transfer Strength", "HDR transfer"),
+      text, kSetTransferStrength, text.Pick("HDR Transfer Strength",
+          last_frame_display_codec.load() ? "Legacy pedestal strength" : "Enhancement strength"),
       0.f, 1.f, "%.2f",
       transfer_inert ? ui::text::kTransferInertTip
-      : text.modern  ? ui::text::kTransferTip
-                     : nullptr);
+                     : ui::text::kTransferTip);
   ImGui::EndDisabled();
   SliderSetting(
-      text, kSetColorStrength, text.Pick("Color Strength", "Color"), 0.f, 1.f, "%.2f",
-      text.modern ? ui::text::kColorTip : nullptr);
-  // v9 Phase 6 transfer bounds (see defaults).  Both steer the resolve's
-  // math, so a change resets the temporal history like the other codec
-  // knobs.
+      text, kSetColorStrength, text.Pick("Color Strength",
+          last_frame_display_codec.load() ? "Enhancement strength" : "Colour transfer"), 0.f, 1.f, "%.2f",
+      ui::text::kColorTip);
+  // Display-only resolve controls; they do not change the model's input.
+  ImGui::BeginDisabled(have_workset && !ui_display);
   SliderSetting(
       text, kSetChromaClamp, text.Pick("Chroma clamp (stops)", "Chroma clamp"),
       0.25f, 2.f, "%.2f",
@@ -16026,6 +16286,8 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
       "  Consistent also undoes the curve's gain change, damped where the"
       " curve is too flat to invert.  The model sees the same input either"
       " way.");
+  ImGui::EndDisabled();
+  ImGui::BeginDisabled(have_workset && (!have_hdr_workset || ui_display));
   ToggleSetting(
       text, kSetNeuralFloorGuard,
       text.Pick("Neural-floor chroma guard", "Near-black colour guard"),
@@ -16035,6 +16297,8 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
       " of amplifying the model's noise into green or grey specks.  Off is"
       " the previous math.");
 
+  ImGui::EndDisabled();
+  ImGui::BeginDisabled(have_workset && (!have_hdr_workset || ui_units.absolute));
   // The feed: where a relative HDR source's NR input scale comes from.
   constexpr const char* kFeedModes[] = {
       "Auto (recommended)", "v1 (frame meter)", "v2 (game exposure)"};
@@ -16050,6 +16314,8 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
       " fed as it is lets a bright scene overload NR's input, and NR boils."
       "  Calibrated/absolute sources ignore this.");
 
+  ImGui::EndDisabled();
+  ImGui::BeginDisabled(have_workset && !ui_meter);
   // Normalization governor.  Only relative (GPU-autoscale) sources have a
   // per-frame candidate to govern; calibrated sources already run a fixed
   // divisor, so the controls say so rather than pretending to apply.
@@ -16088,9 +16354,16 @@ inline void DrawSectionHdrDetails(const ui::PanelText& text) {
         " instead of slewing, so raising this only affects tracking lag."
         "  0 behaves as Off.");
   }
+  ImGui::EndDisabled();
 }
 
 inline void DrawSectionGuideOverrides(const ui::PanelText& text) {
+  constexpr const char* guide_modes[] = {"Auto", "Legacy", "Declared"};
+  constexpr const char* rect_modes[] = {"Auto", "Declared", "Resource"};
+  constexpr const char* contract_tip = "Auto uses readable declarations; ambiguous inputs keep the legacy interpretation.";
+  ChoiceSetting(text, kSetGuideContract, "Guide interpretation", guide_modes, contract_tip);
+  ChoiceSetting(text, kSetOutputRect, "Output rectangle", rect_modes, contract_tip);
+  ChoiceSetting(text, kSetInputRect, "Input rectangle", rect_modes, contract_tip);
   if (text.guide_overrides_note != nullptr) {
     ImGui::PushTextWrapPos(0.f);
     ImGui::TextUnformatted(text.guide_overrides_note);
@@ -16643,7 +16916,14 @@ inline std::string BuildSupportReport() {
          << " NRIntensity=" << intensity.load()
          << " NRPasses=" << stack_passes.load()
          << " NRPreUpscale=" << nr_before_upscale.load()
+         << " NRGuideContract=" << guide_contract_mode.load()
+         << " NROutputRect=" << output_rect_mode.load()
+         << " NRInputRect=" << input_rect_mode.load()
          << " NRCodecMode=" << codec_mode.load()
+         << " NRTransferStrength=" << transfer_strength.load()
+         << " NRColorStrength=" << color_strength.load()
+         << " NRDisplayPedestal=" << display_pedestal.load()
+         << " NRPedestalStrength=" << pedestal_strength.load()
          << " NRFollowInputRes=" << nr_follow_input_res.load()
          << " NRResolutionScale=" << nr_resolution_scale.load()
          << " EnableHooks="
@@ -16667,6 +16947,7 @@ inline std::string BuildSupportReport() {
          << " last_result=" << result << " input=" << last_input_width.load()
          << "x" << last_input_height.load() << " output="
          << last_output_width.load() << "x" << last_output_height.load() << "\n";
+  report << "NR-EVAL v1 " << evaluation::TotalsJson(evaluation::ReadTotals()) << "\n";
   if (!telemetry.empty()) report << "telemetry: " << telemetry << "\n";
   return report.str();
 }
@@ -16975,6 +17256,8 @@ inline void DrawPanelBody(reshade::api::effect_runtime* runtime) {
       if (card.action == ui::CardAction::kTurnOn) SetNrEnabledFromUi(true);
       if (card.action == ui::CardAction::kOpenDiagnostics) ui_open_diagnostics = true;
     }
+    ImGui::Text(ui::Tr("Selected insertion point: %s"),
+        ui::Tr(nr_before_upscale.load() ? "Before upscaling" : "After upscaling"));
     DrawIssueReport();
     if (classic) {
       ui::StyleScope footer;
@@ -17315,6 +17598,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "ConfigVersion", stored_config_version);
   const bool future_config = version_present && stored_config_version > kConfigVersion;
   const bool migrate_config = !future_config && stored_config_version != kConfigVersion;
+  Log(reshade::log::level::info,
+      "config schema supported=" + std::to_string(kConfigVersion));
 
   // Saved values start AT the defaults, so a stale config simply loads
   // nothing and the apply section below persists a fresh default state.
@@ -17331,6 +17616,7 @@ inline void LoadConfiguration() {
   bool saved_skin_independent = defaults::kSkinIndependent;
   bool saved_auto_mask = defaults::kAutoMask;
   bool saved_ui_correction = defaults::kUiCorrection;
+  uint32_t saved_guide_contract = 0, saved_output_rect = 0, saved_input_rect = 0;
   uint32_t saved_depth_mode = defaults::kDepthMode;
   float saved_motion_x = defaults::kMvecScale;
   float saved_motion_y = defaults::kMvecScale;
@@ -17345,6 +17631,7 @@ inline void LoadConfiguration() {
   float saved_chroma_clamp = defaults::kChromaClampStops;
   uint32_t saved_transfer_mode = defaults::kTransferMode;
   uint32_t saved_display_pedestal = defaults::kDisplayPedestal;
+  float saved_pedestal_strength = defaults::kPedestalStrength;
   uint32_t saved_feed_mode = defaults::kFeedMode;
   uint32_t saved_norm_governor = defaults::kNormGovernor;
   float saved_norm_slew = defaults::kNormSlewStops;
@@ -17417,6 +17704,9 @@ inline void LoadConfiguration() {
   reshade::get_config_value(
       nullptr, kConfigSection, "NRUICorrection", saved_ui_correction);
   reshade::get_config_value(nullptr, kConfigSection, "NRDepthMode", saved_depth_mode);
+  reshade::get_config_value(nullptr, kConfigSection, "NRGuideContract", saved_guide_contract);
+  reshade::get_config_value(nullptr, kConfigSection, "NROutputRect", saved_output_rect);
+  reshade::get_config_value(nullptr, kConfigSection, "NRInputRect", saved_input_rect);
   reshade::get_config_value(nullptr, kConfigSection, "NRMVecScaleX", saved_motion_x);
   reshade::get_config_value(nullptr, kConfigSection, "NRMVecScaleY", saved_motion_y);
   reshade::get_config_value(
@@ -17441,6 +17731,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "NRTransferMode", saved_transfer_mode);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRDisplayPedestal", saved_display_pedestal);
+  reshade::get_config_value(
+      nullptr, kConfigSection, "NRPedestalStrength", saved_pedestal_strength);
   uint32_t saved_dedupe_mode = defaults::kDedupeMode;
   reshade::get_config_value(
       nullptr, kConfigSection, "DedupeMode", saved_dedupe_mode);
@@ -17827,8 +18119,17 @@ inline void LoadConfiguration() {
     if (saved_look.upsample != 1u) saved_look.upsample = 0u;
     if (saved_display_pedestal > 1u) saved_display_pedestal = 0u;
   }
+  if (migrate_config && stored_config_version < 9u) {
+    // Auto adopts the new PQ rule. Manual Always and every numeric strength
+    // survive. Legacy Auto remains selectable after the v9 schema is saved.
+    if (saved_display_pedestal == 0u) saved_display_pedestal = defaults::kDisplayPedestal;
+    Log(reshade::log::level::info,
+        "config schema v" + std::to_string(stored_config_version)
+            + " migrated key-wise to v9 (pedestal Auto skips PQ subtraction;"
+              " manual modes and strengths preserved; Legacy Auto remains selectable)");
+  }
   std::string ignored_keys;
-  for (const char* key : {"NRAutoFgFallback", "NRScreenshotSource", "NROutputRect",
+  for (const char* key : {"NRAutoFgFallback", "NRScreenshotSource",
                           "NRDetailStability", "NRLookHaloBrightSide",
                           "NRSdrBlackRestore", "NRStyleHighlightGuard"}) {
     char value[256]{};
@@ -17916,6 +18217,9 @@ inline void LoadConfiguration() {
       saved_look.upsample, defaults::kLook.upsample, 0u, 1u, "NRLookUpsample");
   enabled = saved_enabled;
   nr_before_upscale = saved_pre_upscale;
+  guide_contract_mode = SanitizeEnumKey(saved_guide_contract, 0u, 0u, 2u, "NRGuideContract");
+  output_rect_mode = SanitizeEnumKey(saved_output_rect, 0u, 0u, 2u, "NROutputRect");
+  input_rect_mode = SanitizeEnumKey(saved_input_rect, 0u, 0u, 2u, "NRInputRect");
   codec_mode = SanitizeEnumKey(
       saved_codec_mode, defaults::kCodecMode, 0u, 3u, "NRCodecMode");
   proxy_anchor_nits = SanitizeFloatKey(
@@ -17972,7 +18276,9 @@ inline void LoadConfiguration() {
   transfer_mode = SanitizeEnumKey(
       saved_transfer_mode, defaults::kTransferMode, 0u, 1u, "NRTransferMode");
   display_pedestal = SanitizeEnumKey(
-      saved_display_pedestal, defaults::kDisplayPedestal, 0u, 1u, "NRDisplayPedestal");
+      saved_display_pedestal, defaults::kDisplayPedestal, 0u, 4u, "NRDisplayPedestal");
+  pedestal_strength = SanitizeFloatKey(
+      saved_pedestal_strength, defaults::kPedestalStrength, 0.f, 1.f, "NRPedestalStrength");
   dedupe_mode = SanitizeEnumKey(
       saved_dedupe_mode, defaults::kDedupeMode, 0u, 1u, "DedupeMode");
   list_state_mode.store(static_cast<int>(SanitizeEnumKey(

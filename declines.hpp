@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include "evaluation_ledger.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -180,6 +182,26 @@ inline const char* const kNrDeclineTags[
     "d3d11_deferred", "foreign_nr", "teardown_pending",
 };
 inline void CountNrDecline(NrDeclineReason reason) {
+  using evaluation::Outcome;
+  Outcome outcome = Outcome::kDeclined;
+  switch (reason) {
+    case NrDeclineReason::kNgxMissingGuides: outcome = Outcome::kMissingInput; break;
+    case NrDeclineReason::kNgxNotDlssEvaluation:
+    case NrDeclineReason::kSourceOther:
+    case NrDeclineReason::kForeignNr: outcome = Outcome::kExcluded; break;
+    case NrDeclineReason::kNrDisabledEvaluation: outcome = Outcome::kDisabled; break;
+    case NrDeclineReason::kGameEvaluateFailed: outcome = Outcome::kGameFailed; break;
+    case NrDeclineReason::kMalformedEvaluate:
+    case NrDeclineReason::kImplausibleArgument: outcome = Outcome::kMalformed; break;
+    case NrDeclineReason::kZeroStrengthPassthrough: outcome = Outcome::kPassthrough; break;
+    case NrDeclineReason::kFailureBackoff:
+    case NrDeclineReason::kSlotWarmupMaturation:
+    case NrDeclineReason::kBridgeDown:
+    case NrDeclineReason::kBridgeBusy:
+    case NrDeclineReason::kTeardownPending: outcome = Outcome::kRetry; break;
+    default: break;
+  }
+  evaluation::Decline(static_cast<uint32_t>(reason), outcome);
   nr_decline_counts[static_cast<size_t>(reason)].fetch_add(
       1, std::memory_order_relaxed);
 }

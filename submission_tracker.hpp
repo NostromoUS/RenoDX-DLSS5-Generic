@@ -39,8 +39,10 @@
 #include <d3d12.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +63,17 @@ struct GenerationSubmission {
   uint64_t value = 0;
 };
 
+// A readback must distinguish completed execution from an unsubmitted Reset.
+// Co-owned with every recording that carries its copies; unlike a queue-wide
+// lease, unrelated idle queues cannot delay it. Access under tracker_mutex.
+enum class ReadbackState { kPending, kCompleted, kDiscarded, kDeviceRemoved };
+struct ReadbackProof {
+  size_t recordings = 0;
+  bool tracked = false;
+  bool discarded = false;
+  bool device_removed = false;
+};
+
 // One recording generation of one command list.
 struct Generation {
   // False once the recording was discarded (Reset) or the list destroyed:
@@ -69,6 +82,7 @@ struct Generation {
   // Addon-owned GPU objects this recording can reference (deduplicated).
   std::vector<const void*> uses;
   std::vector<GenerationSubmission> submissions;
+  std::vector<std::shared_ptr<ReadbackProof>> readbacks;
 };
 
 struct ListState {
@@ -205,7 +219,8 @@ inline ID3D12CommandList* DestroyAlias(ID3D12CommandList* list) {
 
 // Record-time (evaluate thread): the list's current recording can reference
 // `resource`. Idempotent within a generation.
-inline void TrackUse(ID3D12CommandList* list, const void* resource) {
+inline void TrackUse(ID3D12CommandList* list, const void* resource,
+                     const std::shared_ptr<ReadbackProof>& readback = {}) {
   if (list == nullptr || resource == nullptr) return;
   ever_tracked_uses.store(true, std::memory_order_release);
   ID3D12CommandList* const native = DestroyAlias(list);
@@ -215,6 +230,12 @@ inline void TrackUse(ID3D12CommandList* list, const void* resource) {
   RememberAliasLocked(list, key, state);
   if (native != list) RememberAliasLocked(native, key, state);
   Generation& generation = state.generations[state.current];
+  if (readback && std::find(generation.readbacks.begin(), generation.readbacks.end(), readback)
+                      == generation.readbacks.end()) {
+    generation.readbacks.push_back(readback);
+    ++readback->recordings;
+    readback->tracked = true;
+  }
   for (const void* use : generation.uses) {
     if (use == resource) return;
   }
@@ -335,6 +356,7 @@ inline size_t PruneCompletedGenerations() {
     for (auto gen_it = generations.begin(); gen_it != generations.end();) {
       const Generation& generation = gen_it->second;
       bool done = !generation.open;
+      bool device_removed = false;
       if (done) {
         for (const GenerationSubmission& submission :
              generation.submissions) {
@@ -343,6 +365,7 @@ inline size_t PruneCompletedGenerations() {
             break;
           }
           const uint64_t completed = submission.fence->GetCompletedValue();
+          device_removed |= completed == UINT64_MAX;
           if (completed != UINT64_MAX && completed < submission.value) {
             done = false;
             break;
@@ -352,6 +375,11 @@ inline size_t PruneCompletedGenerations() {
       if (!done) {
         ++gen_it;
         continue;
+      }
+      for (const auto& readback : generation.readbacks) {
+        --readback->recordings;
+        readback->discarded |= generation.submissions.empty();
+        readback->device_removed |= device_removed;
       }
       for (const void* use : generation.uses) {
         const auto use_it = live_uses.find(use);
@@ -385,6 +413,14 @@ inline bool ResourceReleasable(const void* resource) {
   if (resource == nullptr) return true;
   std::lock_guard<std::mutex> lock(tracker_mutex);
   return live_uses.find(resource) == live_uses.end();
+}
+
+inline ReadbackState QueryReadback(const std::shared_ptr<ReadbackProof>& proof) {
+  std::lock_guard<std::mutex> lock(tracker_mutex);
+  if (!proof || !proof->tracked) return ReadbackState::kDiscarded;
+  if (proof->recordings != 0) return ReadbackState::kPending;
+  if (proof->device_removed) return ReadbackState::kDeviceRemoved;
+  return proof->discarded ? ReadbackState::kDiscarded : ReadbackState::kCompleted;
 }
 
 // True when every recording that carries addon work has been submitted AND

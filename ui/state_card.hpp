@@ -153,6 +153,8 @@ enum class CardAction : std::uint8_t {
 // Everything the card may depend on, as plain data.
 struct CardInputs {
   bool partial_latched = false;
+  std::uint8_t recent_state = 0;  // 0 unavailable, 1 completed, 2 unsuccessful, 3 stale
+  bool recent_retry = false, recent_before = false;
   NrVerdict verdict;
   // The alpha40 hint machine: 0 none, 1 DLSS off, 2 frame generation only,
   // 3 DLSS outside Direct3D 12 (A-4).
@@ -449,6 +451,20 @@ inline StatusCard ComputeStatusCard(const CardInputs& in) {
       return card;
 
     case NrState::kEngaged:
+      if (in.recent_state >= 2) {
+        Set(card, in.recent_state == 3 || in.recent_retry ? CardId::kWaitingForDlss : CardId::kNotRunning,
+            in.recent_state == 3 || in.recent_retry ? CardTone::kIdle : CardTone::kWarn,
+            CardGlyph::kWaiting, in.recent_state == 3 || in.recent_retry
+                ? "NR is waiting for DLSS" : "NR is on but holding back",
+            in.recent_state == 3 ? "No recent evaluations."
+                : in.recent_retry ? "NR is waiting to retry." : "No recent NR completion.");
+        if (in.recent_state == 2 && !in.recent_retry) {
+          SetFix(card, "Copy the support report under Diagnostics and share it with "
+                       "ReShade.log.");
+          card.action = CardAction::kOpenDiagnostics;
+        }
+        return card;
+      }
       if (in.active_features == 0) {
         Set(card, CardId::kWaitingForDlss, CardTone::kIdle, CardGlyph::kWaiting,
             "NR is waiting for DLSS",

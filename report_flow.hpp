@@ -105,6 +105,7 @@ struct ActivitySnapshot {
   uint64_t nr_after_evaluations = 0;
   uint64_t nr_before_evaluations = 0;
   bool before_selected = false;
+  evaluation::Totals ledger;
 };
 
 inline std::mutex mutex;
@@ -157,7 +158,7 @@ inline issue_report::ActivitySnapshot ReportActivitySnapshot() {
       intercepted_streamline_tag_calls.load(std::memory_order_relaxed),
       successful_evaluations.load(std::memory_order_relaxed),
       successful_pre_sr_evaluations.load(std::memory_order_relaxed),
-      nr_before_upscale.load(std::memory_order_relaxed)};
+      nr_before_upscale.load(std::memory_order_relaxed), evaluation::ReadTotals()};
 }
 
 // A live snapshot, independent of the periodic telemetry line. The report
@@ -685,6 +686,10 @@ inline void RunReportCaptureJob() {
              << (lastgasp::write_minidump.load(std::memory_order_acquire) != nullptr)
              << "}}";
   field("self_tests", self_tests.str());
+  field("evaluation_accounting", "{\"at_start\":"
+      + evaluation::TotalsJson(activity_at_start.ledger) + ",\"after_capture\":"
+      + evaluation::TotalsJson(activity_after.ledger) + "}");
+  field("evaluation_history", evaluation::HistoryJson());
   field("dx11", "{\"at_start\": " + dx11_at_start
                   + ", \"after_capture\": " + Dx11ReportSnapshot() + "}");
   field("diagnostic_options", "{\"crash_dump\": "

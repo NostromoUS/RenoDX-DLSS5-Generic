@@ -422,6 +422,7 @@ inline std::atomic_uint64_t bridge_skew{0};
 // One set of twins per source DLSS feature, rebuilt when the game's surfaces
 // change shape.  runtime_mutex guards the map and the retired list.
 struct BridgeSurfaceSet {
+  std::array<evaluation::TransportSteps, 5> diagnostics{};
   D3D11_TEXTURE2D_DESC descs[bridge::kResourceKeyCount] = {};
   bool has_exposure = false;
   // The insertion point the set was built for (NRPreUpscale): it decides
@@ -638,7 +639,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
                                 DXGI_FORMAT format, UINT bind,
                                 ID3D11Texture2D** twin11,
                                 ID3D12Resource** twin12,
-                                BridgeSharedTwinFailure* failure = nullptr) {
+                                BridgeSharedTwinFailure* failure = nullptr, uint32_t role = 2) {
   if (failure != nullptr) *failure = {};
   if (twin11 == nullptr || twin12 == nullptr) return E_POINTER;
   *twin11 = nullptr;
@@ -655,6 +656,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
   desc.MiscFlags =
       D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
   HRESULT hr = bridge.device11->CreateTexture2D(&desc, nullptr, twin11);
+  evaluation::BridgeApi(role, "CreateTexture2D(shared)", hr, format, bind);
   if (FAILED(hr) || *twin11 == nullptr) {
     if (failure != nullptr) {
       failure->step = BridgeMotionTransportStep::kD3D11CreateSharedTexture;
@@ -670,6 +672,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
   IDXGIResource1* dxgi = nullptr;
   HANDLE shared = nullptr;
   hr = (*twin11)->QueryInterface(IID_PPV_ARGS(&dxgi));
+  evaluation::BridgeApi(role, "QueryInterface(IDXGIResource1)", hr);
   if (SUCCEEDED(hr) && dxgi == nullptr) hr = E_NOINTERFACE;
   if (FAILED(hr) && failure != nullptr) {
     failure->step = BridgeMotionTransportStep::kD3D11QuerySharedResource;
@@ -680,6 +683,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
   }
   if (SUCCEEDED(hr)) {
     hr = dxgi->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared);
+    evaluation::BridgeApi(role, "CreateSharedHandle", hr);
     if (SUCCEEDED(hr) && shared == nullptr) hr = E_HANDLE;
     if (FAILED(hr) && failure != nullptr) {
       failure->step = BridgeMotionTransportStep::kD3D11CreateSharedHandle;
@@ -692,6 +696,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
   ReleaseCom(dxgi);
   if (SUCCEEDED(hr)) {
     hr = bridge.device12->OpenSharedHandle(shared, IID_PPV_ARGS(twin12));
+    evaluation::BridgeApi(role, "OpenSharedHandle", hr);
     if (SUCCEEDED(hr) && *twin12 == nullptr) hr = E_FAIL;
     if (FAILED(hr) && failure != nullptr) {
       failure->step = BridgeMotionTransportStep::kD3D12OpenSharedHandle;
@@ -713,7 +718,7 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
 // committed one where tiled resources are unavailable for the format.
 // Returns the committed attempt's HRESULT on failure.
 inline HRESULT CreateStandIn12(const D3D11_TEXTURE2D_DESC& source,
-                               ID3D12Resource** resource) {
+                               ID3D12Resource** resource, uint32_t role) {
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Width = source.Width;
@@ -723,22 +728,26 @@ inline HRESULT CreateStandIn12(const D3D11_TEXTURE2D_DESC& source,
   desc.Format = source.Format;
   desc.SampleDesc.Count = 1;
   desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
-  if (SUCCEEDED(bridge.device12->CreateReservedResource(
-          &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-          IID_PPV_ARGS(resource)))) {
+  HRESULT hr = bridge.device12->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(resource));
+  evaluation::BridgeApi(role, "CreateReservedResource", hr, source.Format);
+  if (SUCCEEDED(hr)) {
     return S_OK;
   }
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
-  return bridge.device12->CreateCommittedResource(
+  hr = bridge.device12->CreateCommittedResource(
       &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
       nullptr, IID_PPV_ARGS(resource));
+  evaluation::BridgeApi(role, "CreateCommittedResource", hr, source.Format);
+  return hr;
 }
 
 inline bool SameSurface(const D3D11_TEXTURE2D_DESC& a,
                         const D3D11_TEXTURE2D_DESC& b) {
   return a.Width == b.Width && a.Height == b.Height && a.Format == b.Format
          && a.SampleDesc.Count == b.SampleDesc.Count
+         && a.ArraySize == b.ArraySize && a.MipLevels == b.MipLevels
          && a.BindFlags == b.BindFlags;
 }
 
@@ -749,33 +758,6 @@ inline std::string DescribeSurface(const D3D11_TEXTURE2D_DESC& desc) {
                 desc.SampleDesc.Count, desc.BindFlags);
   return text;
 }
-
-// The RGBA32F route keeps ordinary finite R32G32_FLOAT motion components at
-// binary32 precision; shader float load/store does not promise bitwise NaN
-// payload or denormal preservation.
-inline constexpr char kBridgeMotionToTransportShader[] = R"HLSL(
-Texture2D<float2> Source : register(t0);
-RWTexture2D<float4> Destination : register(u0);
-[numthreads(8, 8, 1)]
-void main(uint3 dispatch_id : SV_DispatchThreadID) {
-  uint width, height;
-  Destination.GetDimensions(width, height);
-  if (dispatch_id.x >= width || dispatch_id.y >= height) return;
-  Destination[dispatch_id.xy] = float4(Source.Load(int3(dispatch_id.xy, 0)), 0.0, 0.0);
-}
-)HLSL";
-
-inline constexpr char kBridgeMotionFromTransportShader[] = R"HLSL(
-Texture2D<float4> Source : register(t0);
-RWTexture2D<float2> Destination : register(u0);
-[numthreads(8, 8, 1)]
-void main(uint3 dispatch_id : SV_DispatchThreadID) {
-  uint width, height;
-  Destination.GetDimensions(width, height);
-  if (dispatch_id.x >= width || dispatch_id.y >= height) return;
-  Destination[dispatch_id.xy] = Source.Load(int3(dispatch_id.xy, 0)).xy;
-}
-)HLSL";
 
 struct BridgeMotionCandidate {
   ID3D11Texture2D* source_stage = nullptr;
@@ -825,8 +807,14 @@ inline HRESULT CheckD3D11BridgeFormat(
     DXGI_FORMAT format, UINT required_support) {
   UINT support = 0;
   const HRESULT hr = bridge.device11_base->CheckFormatSupport(format, &support);
+  evaluation::BridgeApi(2, "CheckFormatSupport", hr, format);
+  if (evaluation::active) {
+    evaluation::active->bridge[2].support1 = support;
+    evaluation::active->bridge[2].required1 = required_support;
+  }
   if (FAILED(hr)) return hr;
   if ((support & required_support) != required_support) {
+    evaluation::BridgeCondition(2, "D3D11 format support bits missing");
     return DXGI_ERROR_UNSUPPORTED;
   }
   return S_OK;
@@ -838,9 +826,16 @@ inline HRESULT CheckD3D12BridgeFormat(
   support.Format = format;
   const HRESULT hr = bridge.device12->CheckFeatureSupport(
       D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+  evaluation::BridgeApi(2, "CheckFeatureSupport", hr, format);
+  if (evaluation::active) {
+    auto& detail = evaluation::active->bridge[2];
+    detail.support1 = support.Support1; detail.support2 = support.Support2;
+    detail.required1 = required_support1; detail.required2 = required_support2;
+  }
   if (FAILED(hr)) return hr;
   if ((support.Support1 & required_support1) != required_support1
       || (support.Support2 & required_support2) != required_support2) {
+    evaluation::BridgeCondition(2, "D3D12 format support bits missing");
     return DXGI_ERROR_UNSUPPORTED;
   }
   return S_OK;
@@ -858,6 +853,7 @@ inline HRESULT CompileBridgeMotionShader(const char* source, ID3DBlob** bytecode
   const HRESULT hr = renodx::utils::directx::pD3DCompile(
       source, std::strlen(source), "DLSS5 Generic D3D11 bridge motion", nullptr,
       nullptr, "main", "cs_5_0", 0, 0, bytecode, &errors);
+  evaluation::BridgeApi(2, "D3DCompile(motion)", hr);
   if (FAILED(hr) && errors != nullptr && compiler_errors != nullptr) {
     compiler_errors->assign(
         static_cast<const char*>(errors->GetBufferPointer()),
@@ -923,6 +919,7 @@ inline bool EnsureBridgeMotionConversionPipeline(
   hr = bridge.device11->CreateComputeShader(
       to_transport->GetBufferPointer(), to_transport->GetBufferSize(), nullptr,
       &motion_cs11);
+  evaluation::BridgeApi(2, "CreateComputeShader(motion)", hr);
   if (FAILED(hr) || motion_cs11 == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D11CreateConversionShader,
                 FAILED(hr) ? hr : E_FAIL);
@@ -966,6 +963,7 @@ inline bool EnsureBridgeMotionConversionPipeline(
   root_desc.pParameters = parameters;
   hr = renodx::utils::directx::pD3D12SerializeRootSignature(
       &root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+  evaluation::BridgeApi(2, "D3D12SerializeRootSignature(motion)", hr);
   if (FAILED(hr) || serialized == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D12SerializeConversionRootSignature,
                 FAILED(hr) ? hr : E_FAIL);
@@ -973,6 +971,7 @@ inline bool EnsureBridgeMotionConversionPipeline(
   hr = bridge.device12->CreateRootSignature(
       0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
       IID_PPV_ARGS(&root12));
+  evaluation::BridgeApi(2, "CreateRootSignature(motion)", hr);
   if (FAILED(hr) || root12 == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D12CreateConversionRootSignature,
                 FAILED(hr) ? hr : E_FAIL);
@@ -983,6 +982,7 @@ inline bool EnsureBridgeMotionConversionPipeline(
   pso_desc.CS.BytecodeLength = from_transport->GetBufferSize();
   hr = bridge.device12->CreateComputePipelineState(
       &pso_desc, IID_PPV_ARGS(&pso12));
+  evaluation::BridgeApi(2, "CreateComputePipelineState(motion)", hr);
   if (FAILED(hr) || pso12 == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D12CreateConversionPipeline,
                 FAILED(hr) ? hr : E_FAIL);
@@ -1063,6 +1063,7 @@ inline bool TryCreateBridgeMotionCandidate(
   source_stage.MiscFlags = 0;
   hr = bridge.device11->CreateTexture2D(&source_stage, nullptr,
                                         &candidate.source_stage);
+  evaluation::BridgeApi(2, "CreateTexture2D(motion stage)", hr);
   if (FAILED(hr) || candidate.source_stage == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D11CreateSourceStage,
                 FAILED(hr) ? hr : E_FAIL, 0);
@@ -1073,6 +1074,7 @@ inline bool TryCreateBridgeMotionCandidate(
   source_view.Texture2D.MipLevels = 1;
   hr = bridge.device11->CreateShaderResourceView(
       candidate.source_stage, &source_view, &candidate.source_srv);
+  evaluation::BridgeApi(2, "CreateShaderResourceView(motion)", hr);
   if (FAILED(hr) || candidate.source_srv == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D11CreateSourceSrv,
                 FAILED(hr) ? hr : E_FAIL, D3D11_BIND_SHADER_RESOURCE);
@@ -1083,6 +1085,7 @@ inline bool TryCreateBridgeMotionCandidate(
   converted.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
   hr = bridge.device11->CreateTexture2D(&converted, nullptr,
                                         &candidate.conversion_stage);
+  evaluation::BridgeApi(2, "CreateTexture2D(motion conversion)", hr);
   if (FAILED(hr) || candidate.conversion_stage == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D11CreateConversionStage,
                 FAILED(hr) ? hr : E_FAIL, D3D11_BIND_UNORDERED_ACCESS);
@@ -1093,6 +1096,7 @@ inline bool TryCreateBridgeMotionCandidate(
   hr = bridge.device11->CreateUnorderedAccessView(
       candidate.conversion_stage, &conversion_view,
       &candidate.conversion_uav);
+  evaluation::BridgeApi(2, "CreateUnorderedAccessView(motion)", hr);
   if (FAILED(hr) || candidate.conversion_uav == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D11CreateConversionUav,
                 FAILED(hr) ? hr : E_FAIL, D3D11_BIND_UNORDERED_ACCESS);
@@ -1143,6 +1147,7 @@ inline bool TryCreateBridgeMotionCandidate(
       &heap, D3D12_HEAP_FLAG_NONE, &motion_desc,
       D3D12_RESOURCE_STATE_COMMON, nullptr,
       IID_PPV_ARGS(&candidate.motion12));
+  evaluation::BridgeApi(2, "CreateCommittedResource(motion)", hr);
   if (FAILED(hr) || candidate.motion12 == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D12CreateMotionTexture,
                 FAILED(hr) ? hr : E_FAIL, 0);
@@ -1153,6 +1158,7 @@ inline bool TryCreateBridgeMotionCandidate(
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   hr = bridge.device12->CreateDescriptorHeap(
       &heap_desc, IID_PPV_ARGS(&candidate.descriptors));
+  evaluation::BridgeApi(2, "CreateDescriptorHeap(motion)", hr);
   if (FAILED(hr) || candidate.descriptors == nullptr) {
     return fail(BridgeMotionTransportStep::kD3D12CreateDescriptorHeap,
                 FAILED(hr) ? hr : E_FAIL, 0);
@@ -1242,6 +1248,17 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
       if (i == key(ResourceKey::kExposureTexture) && !has_exposure) continue;
       same = SameSurface(set.descs[i], descs[i]);
     }
+    if (same && evaluation::active) {
+      evaluation::active->bridge = set.diagnostics;
+      evaluation::active->bridge_reused = true;
+      for (uint32_t i = 0; i < set.diagnostics.size(); ++i) {
+        if (set.diagnostics[i].failures != 0 && evaluation::active->bridge_role == ~0u) {
+          evaluation::active->bridge_role = i;
+          evaluation::active->bridge_step = set.diagnostics[i].first_step;
+          evaluation::active->bridge_hr = set.diagnostics[i].first_hr;
+        }
+      }
+    }
     if (same && set.usable) return &found->second;
     if (same && (set.retry_present == 0 || present_generation < set.retry_present)) {
       *refusal = set.retry_present == 0 ? NrDeclineReason::kBridgeFormat
@@ -1274,7 +1291,8 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
   // VRAM pressure at a load or an alt-tab, a shared-handle failure) is not,
   // and makes the refusal a retry.
   HRESULT transient = S_OK;
-  const auto created = [&transient](HRESULT hr) {
+  const auto created = [&transient](HRESULT hr, const char* step = nullptr, uint32_t role = 3) {
+    if (step) evaluation::BridgeApi(role, step, hr);
     if (FAILED(hr) && hr != E_INVALIDARG && hr != DXGI_ERROR_UNSUPPORTED) {
       transient = hr;
     }
@@ -1293,6 +1311,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     textures[key(copied)]->GetDevice(&owner);
     if (failure == nullptr
         && !renodx::utils::directx::SameNativeObject(owner, bridge.device11_base)) {
+      evaluation::BridgeCondition(static_cast<uint32_t>(key(copied)), "resource belongs to another device");
       failure = copied == ResourceKey::kOutput
                     ? "the DLSS output lives on a different D3D11 device than the"
                       " context that evaluated it"
@@ -1313,10 +1332,12 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     ReleaseCom(owner);
   }
   if (failure == nullptr && (motion.SampleDesc.Count != 1 || depth.SampleDesc.Count != 1)) {
+    evaluation::BridgeCondition(motion.SampleDesc.Count != 1 ? 2 : 3, "multisampled guide");
     failure = "multisampled motion vectors or depth cannot be copied into a"
               " single-sample twin";
   }
   if (failure == nullptr && pre && color.SampleDesc.Count != 1) {
+    evaluation::BridgeCondition(0, "multisampled Color");
     failure = "a multisampled input color cannot be copied into a single-sample"
               " twin";
   }
@@ -1328,7 +1349,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
       && !created(CreateSharedTwin(
           output, output.Format,
           D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE,
-          &set.output11, &set.output12))) {
+          &set.output11, &set.output12, nullptr, 1))) {
     failure = "the output format cannot be shared as a UAV twin";
   }
   const auto motion_preference = static_cast<BridgeMotionTransportPreference>(
@@ -1345,7 +1366,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     bool made = false;
     for (UINT bind : kGuideBinds) {
       if ((made = created(CreateSharedTwin(color, color.Format, bind,
-                                           &set.color11, &set.color12)))) {
+                                           &set.color11, &set.color12, nullptr, 0)))) {
         break;
       }
     }
@@ -1491,27 +1512,29 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     uav.Format = DXGI_FORMAT_R32_FLOAT;
     uav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     if (view == DXGI_FORMAT_UNKNOWN) {
+      evaluation::BridgeCondition(3, "typed depth has no supported plane view");
       failure = "the depth-stencil format is typed, so its depth plane has no"
                 " shader view";
     } else if (bridge.depth_cs == nullptr) {
+      evaluation::BridgeCondition(3, "depth conversion shader unavailable");
       failure = "the depth conversion shader could not be created";
     } else if (!created(bridge.device11->CreateTexture2D(&stage, nullptr,
-                                                         &set.depth_stage))
+                                                         &set.depth_stage), "CreateTexture2D(depth stage)")
                || !created(bridge.device11->CreateShaderResourceView(
-                   set.depth_stage, &srv, &set.depth_srv))
+                   set.depth_stage, &srv, &set.depth_srv), "CreateShaderResourceView(depth)")
                || !created(CreateSharedTwin(depth, DXGI_FORMAT_R32_FLOAT,
                                             D3D11_BIND_UNORDERED_ACCESS
                                                 | D3D11_BIND_SHADER_RESOURCE,
-                                            &set.depth11, &set.depth12))
+                                            &set.depth11, &set.depth12, nullptr, 3))
                || !created(bridge.device11->CreateUnorderedAccessView(
-                   set.depth11, &uav, &set.depth_uav))) {
+                   set.depth11, &uav, &set.depth_uav), "CreateUnorderedAccessView(depth)")) {
       failure = "the depth conversion surfaces could not be created";
     }
   } else if (failure == nullptr) {
     bool made = false;
     for (UINT bind : kGuideBinds) {
       if ((made = created(CreateSharedTwin(depth, depth.Format, bind,
-                                           &set.depth11, &set.depth12)))) {
+                                           &set.depth11, &set.depth12, nullptr, 3)))) {
         break;
       }
     }
@@ -1519,7 +1542,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
   }
   if (failure == nullptr
       && !created(CreateStandIn12(pre ? output : color,
-                                  pre ? &set.output12 : &set.color12))) {
+                                  pre ? &set.output12 : &set.color12, pre ? 1 : 0))) {
     failure = "the color/output stand-in could not be created";
   }
   // The exposure twin is optional: every exposure outcome keeps the set, and
@@ -1537,7 +1560,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
       for (UINT bind : kGuideBinds) {
         if ((made = SUCCEEDED(CreateSharedTwin(exposure, exposure.Format, bind,
                                                &set.exposure11,
-                                               &set.exposure12)))) {
+                                               &set.exposure12, nullptr, 4)))) {
           break;
         }
       }
@@ -1555,6 +1578,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     RetireBridgeSet(std::move(set));
     BridgeSurfaceSet refused;
     std::copy(std::begin(descs), std::end(descs), std::begin(refused.descs));
+    if (evaluation::active) refused.diagnostics = evaluation::active->bridge;
     refused.has_exposure = has_exposure;
     // Before rc11 this stayed false, so no pre-upscale evaluate matched the
     // refused shape: each one rebuilt the set and logged this line again.
@@ -1597,6 +1621,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     const D3D12_RESOURCE_DESC desc = shared->GetDesc();
     set.bytes += bridge.device12->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
   }
+  if (evaluation::active) set.diagnostics = evaluation::active->bridge;
   set.usable = true;
   ++bridge_sets_built;
   Log(reshade::log::level::info,
@@ -2040,6 +2065,7 @@ inline void RunBridge(ID3D11DeviceContext* context,
                       bridge::ScopedD3D11Redirect* redirect) {
   using bridge::ResourceKey;
   const bool pre = redirect != nullptr;
+  if (evaluation::active) evaluation::active->route = pre ? evaluation::Route::kBridgeBefore : evaluation::Route::kBridgeAfter;
   bool named = false;
   const auto name = [&named](NrDeclineReason reason) {
     CountNrDecline(reason);
@@ -2081,7 +2107,7 @@ inline void RunBridge(ID3D11DeviceContext* context,
       }
     }
     if (textures[at(ResourceKey::kColor)] == nullptr) {
-      name(NrDeclineReason::kNgxNotDlssEvaluation);
+      name(NrDeclineReason::kNgxMissingGuides);
       return;
     }
     if (resources[at(ResourceKey::kOutput)] == nullptr
@@ -2134,6 +2160,7 @@ inline void RunBridge(ID3D11DeviceContext* context,
 
     RuntimeLock lock(runtime_mutex);
     const uint64_t done = bridge.fence_done12->GetCompletedValue();
+    if (evaluation::active) evaluation::active->bridge_completed_before = done;
     if (done == UINT64_MAX
         || bridge_device_removed.load(std::memory_order_acquire)) {
       MarkBridgeLost("the private Direct3D 12 device was removed");
@@ -2278,7 +2305,16 @@ inline void RunBridge(ID3D11DeviceContext* context,
                    D3D12_RESOURCE_STATE_COMMON);
       }
     }
-    const bool closed = SUCCEEDED(slot.list->Close());
+    // Record existing queue operations only; no completion wait or probe is added.
+    const auto queue_result = [](unsigned step, HRESULT hr) {
+      if (evaluation::active) {
+        evaluation::active->queue_mask |= 1u << step;
+        evaluation::active->queue_results[step] = static_cast<uint32_t>(hr);
+        if (FAILED(hr)) evaluation::active->outcome = evaluation::Outcome::kTransportFailed;
+      }
+      return SUCCEEDED(hr);
+    };
+    const bool closed = queue_result(0, slot.list->Close());
     if (!touched) return;
     if (!closed) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
@@ -2360,7 +2396,7 @@ inline void RunBridge(ID3D11DeviceContext* context,
     } else {
       ctx->CopySubresourceRegion(set->output11, 0, 0, 0, 0, output, 0, nullptr);
     }
-    if (FAILED(ctx->Signal(bridge.fence_in11, value))) {
+    if (!queue_result(1, ctx->Signal(bridge.fence_in11, value))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -2368,21 +2404,25 @@ inline void RunBridge(ID3D11DeviceContext* context,
     ctx->Flush();
     // The value is consumed from here: whatever happens, the return fence
     // must reach it, or the next D3D11 wait never returns.
-    bool submitted = SUCCEEDED(bridge.queue->Wait(bridge.fence_in12, value));
+    bool submitted = queue_result(2, bridge.queue->Wait(bridge.fence_in12, value));
     if (submitted && value == TestBridgeStallValue()) {
       Log(reshade::log::level::warning,
           "RENODX_NR_TEST_BRIDGE_STALL: submission " + std::to_string(value)
               + " waits for its own return fence, which only the watchdog"
                 " can signal");
-      submitted = SUCCEEDED(bridge.queue->Wait(bridge.fence_out12, value));
+      submitted = queue_result(2, bridge.queue->Wait(bridge.fence_out12, value));
     }
     if (submitted) {
       bridge_waits.fetch_add(1, std::memory_order_relaxed);
       ID3D12CommandList* const lists[] = {slot.list};
       bridge.queue->ExecuteCommandLists(1, lists);
       bridge_submits.fetch_add(1, std::memory_order_relaxed);
-      submitted = SUCCEEDED(bridge.queue->Signal(bridge.fence_out12, value))
-                  && SUCCEEDED(bridge.queue->Signal(bridge.fence_done12, value));
+      if (evaluation::active) {
+        evaluation::active->bridge_submitted = true;
+        evaluation::active->bridge_submission = value;
+      }
+      submitted = queue_result(3, bridge.queue->Signal(bridge.fence_out12, value))
+                  && queue_result(4, bridge.queue->Signal(bridge.fence_done12, value));
     }
     slot.value = value;
     set->last_value = value;
@@ -2394,7 +2434,7 @@ inline void RunBridge(ID3D11DeviceContext* context,
       MarkBridgeLost("a Direct3D 12 queue operation failed");
       return;
     }
-    if (FAILED(ctx->Wait(bridge.fence_out11, value))) {
+    if (!queue_result(5, ctx->Wait(bridge.fence_out11, value))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -2426,14 +2466,40 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
                                       Real&& real) {
   CallbackScope callback_scope;
   const Ngx11Nesting nesting;
-  if (!callback_scope || !nesting.outermost || InsideDirectCall()) return real();
+  evaluation::Scope evaluation_scope(!InsideDirectCall(), handle, enabled.load(),
+      nr_before_upscale.load(), nr_before_upscale.load()
+          ? evaluation::Route::kBridgeBefore : evaluation::Route::kBridgeAfter,
+      {guide_contract_mode.load(), output_rect_mode.load(), input_rect_mode.load()});
+  if (!callback_scope) evaluation::Note(evaluation::Outcome::kLifecycleInactive);
+  if (!callback_scope || !nesting.outermost || InsideDirectCall()) return evaluation::Return(real(), !InsideDirectCall());
   // A-1: the bridge calls GetType on the context and unwraps it.
   if (!NgxFirstArgumentUsable(context, entry, slot, kD3D11ContextVtableBytes,
                               ngx11_slot_noncore)) {
     const EvaluateInFlightScope in_flight(true);
     ++intercepted_evaluations;
     CountNrDecline(NrDeclineReason::kImplausibleArgument);
-    return real();
+    return evaluation::Return(real(), !InsideDirectCall());
+  }
+  bool pre = false;
+  {
+    RuntimeLock lock(runtime_mutex);
+    CaptureGameEvaluation(handle, parameters, false);
+    pre = PreSrTakes(handle);
+    if (evaluation::active && evaluation::active->eligibility != 2 && parameters) {
+      for (size_t i = 0; i < bridge::kResourceKeyCount; ++i) {
+        auto* resource = bridge::GetD3D11Resource(parameters, bridge::kResourceKeyNames[i]);
+        D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        if (resource) resource->GetType(&dimension);
+        evaluation::active->source[i].dimension = static_cast<uint16_t>(dimension);
+        if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+          D3D11_TEXTURE2D_DESC d{};
+          static_cast<ID3D11Texture2D*>(resource)->GetDesc(&d);
+          evaluation::active->source[i] = {d.Width, d.Height, static_cast<uint32_t>(d.Format), d.BindFlags,
+              static_cast<uint16_t>(d.MipLevels), static_cast<uint16_t>(d.ArraySize),
+              static_cast<uint16_t>(d.SampleDesc.Count), static_cast<uint16_t>(dimension)};
+        } else if (!resource && i < 4) evaluation::active->missing_inputs |= 1u << i;
+      }
+    }
   }
   const EvaluateChainScope chain_scope;
   // Counted in `seen` from here until this evaluate names its terminal.
@@ -2449,7 +2515,7 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
   // frame to run: an NR-off D3D11 session maps nothing (row 23; the
   // e2e11_native control asserts it).  Outside the runtime lock, as the
   // prime requires.
-  if (nr_before_upscale.load() && enabled.load() && !NrYieldsToForeign()
+  if (pre && enabled.load() && !NrYieldsToForeign()
       && handle != nullptr && parameters != nullptr) {
     // Before upscaling: the bridge names this evaluate's terminal, and the
     // game's evaluate reads NR's result through the redirected Color key
@@ -2458,9 +2524,9 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
     PrimeNgxLoaderSymbols();
     bridge::ScopedD3D11Redirect redirect;
     RunBridge(context, handle, parameters, &redirect);
-    return real();
+    return evaluation::Return(real(), !InsideDirectCall());
   }
-  const NVSDK_NGX_Result result = real();
+  const NVSDK_NGX_Result result = evaluation::Return(real(), !InsideDirectCall());
   if (NVSDK_NGX_FAILED(result)) {
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
