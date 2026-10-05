@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-addon-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
@@ -26,11 +30,13 @@ jobs:
           path: renodx
           submodules: recursive
 
-      - name: Set up Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: 20.1.8
-          platform: x64
+      - name: Use runner Clang
+        shell: pwsh
+        run: |
+          $clangBin = Join-Path $env:ProgramFiles 'LLVM/bin'
+          & "$clangBin/clang-cl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Runner Clang is unavailable.' }
+          $clangBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Set up Visual C++ and Windows SDK
         uses: ilammy/msvc-dev-cmd@v1
