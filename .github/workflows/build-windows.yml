@@ -1,0 +1,69 @@
+name: Build Windows addon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [aw-remastered-auto-present]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out addon
+        uses: actions/checkout@v4
+        with:
+          path: addon
+
+      - name: Check out pinned RenoDX and dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: clshortfuse/renodx
+          ref: 374d07bf0e2fcef112ed1dfee98541bcf16487dd
+          path: renodx
+          submodules: recursive
+
+      - name: Set up Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: latest
+          platform: x64
+
+      - name: Set up Visual C++ and Windows SDK
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Set up RenoDX shader tools
+        shell: pwsh
+        run: ./renodx/scripts/setup-dev-env.ps1 -Update -Tools dxc,slang,glslang
+
+      - name: Test and build addon
+        shell: pwsh
+        run: ./addon/scripts/build-addon.ps1 -RenoDXRoot ./renodx -Configuration Release
+
+      - name: Package test build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item renodx/build/Release/renodx-dlss5.addon64 package/
+          Copy-Item addon/README.md,addon/LICENSE package/
+          $manifest = [ordered]@{
+            addon_commit = '${{ github.sha }}'
+            renodx_commit = '374d07bf0e2fcef112ed1dfee98541bcf16487dd'
+            run = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            sha256 = (Get-FileHash package/renodx-dlss5.addon64 -Algorithm SHA256).Hash
+            qualification = 'Experimental. CPU tests only; game/GPU validation required.'
+          }
+          $manifest | ConvertTo-Json | Set-Content package/build-info.json
+
+      - name: Upload addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: renodx-dlss5-aw-fallback1-windows-x64
+          path: package/
+          if-no-files-found: error
+          retention-days: 30
