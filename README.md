@@ -30,11 +30,18 @@ and are not included here.
 This working copy adds `NRAutoPresentFallback` (off by default), intended for
 Alan Wake Remastered's Direct3D 12 menus and prerendered cinematics. Keep the
 hook point on **Upscaled**, then enable **Present fallback without DLSS**.
+**Fallback Intensity** sets a separate first-pass NR intensity for automatic
+fallback only (default **0.40**, range **0–2**). The main Intensity setting stays
+unchanged and is used again as soon as DLSS resumes. Manually selected Present
+also keeps the main setting. Additional stacked passes retain their own
+intensities; all other preset controls remain shared. Changing the fallback
+slider resets temporal history without recreating the feature.
 Equivalent settings in the existing `[RenoDX.DLSS5]` section of `ReShade.ini`:
 
 ```ini
 NRHookPoint=0
 NRAutoPresentFallback=1
+NRAutoPresentIntensity=0.4
 ```
 
 Successful intercepted SR/RR evaluations keep the existing Upscaled path,
@@ -74,7 +81,9 @@ The initial implementation is deliberately limited:
 - The addon cannot identify a previously enhanced texture that the game
   later copies into another frame. Games presenting cached enhanced images,
   or unobserved third-party frame generation, need additional provenance
-  tracking. Alan Wake Remastered's actual ordering still needs a game test.
+  tracking. The user confirmed gameplay/cinematic/menu fallback transitions
+  work without noticeable delay in Alan Wake Remastered on D3D12 with
+  `aw-fallback1`; the new intensity override in `aw-fallback2` needs an in-game check.
 - Existing NGX serialization has a 750 ms game-call timeout after which it
   allows an unprotected call. This change preserves that existing policy;
   timeout-free operation must be checked during runtime qualification.
@@ -103,7 +112,7 @@ in the overlay. Disabling the option restores the original routing policy.
 
 You do not need Windows locally. Open this fork's **Actions** tab, select a
 successful **Build Windows addon** run for `aw-remastered-auto-present`, and
-download `renodx-dlss5-aw-fallback1-windows-x64` under **Artifacts**. Extract
+download `renodx-dlss5-aw-fallback2-windows-x64` under **Artifacts**. Extract
 `renodx-dlss5.addon64` from the ZIP. The workflow runs on pushes to that branch;
 GitHub may require enabling Actions on a new fork first. Artifacts expire after
 30 days. `build-info.json` records both source revisions and the binary SHA-256.

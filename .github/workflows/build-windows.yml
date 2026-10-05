@@ -70,7 +70,7 @@ jobs:
       - name: Upload addon
         uses: actions/upload-artifact@v4
         with:
-          name: renodx-dlss5-aw-fallback1-windows-x64
+          name: renodx-dlss5-aw-fallback2-windows-x64
           path: package/
           if-no-files-found: error
           retention-days: 30

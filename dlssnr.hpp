@@ -165,7 +165,7 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default into every file, so a stored 1 at schema 6 is inherited, not
 // chosen.
 constexpr uint32_t kConfigVersion = 7;
-constexpr char kAddonVersion[] = "v8.5.0-rc10-aw-fallback1";
+constexpr char kAddonVersion[] = "v8.5.0-rc10-aw-fallback2";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -844,6 +844,9 @@ struct EvaluationContract {
   // presented frame carries the game's UI, so it asks the model for UI
   // correction whatever the pass's own steering says.
   bool ui_correction = false;
+  // A frame-local override of the main Intensity control (stack pass 1).
+  // Other passes and every frame without an override keep their saved values.
+  std::optional<float> intensity_override;
 };
 
 // What the Present hook point changes in the after path (ProcessInline's
@@ -862,6 +865,7 @@ struct PresentTarget {
   bool ui_correction = false;
   // True only for the final swapchain pass, never the pre-FG/HUD-less pass.
   bool capture_display = false;
+  std::optional<float> intensity_override;
 };
 
 inline HMODULE addon_module = nullptr;
@@ -1440,6 +1444,7 @@ inline constexpr bool kPreSr = false;
 // (pre-SR), 2 = Present (present_path.hpp).
 inline constexpr uint32_t kHookPoint = 0;
 inline constexpr bool kAutoPresentFallback = false;
+inline constexpr float kAutoPresentIntensity = 0.4f;
 // The Present hook point's guides: 0 = Optional (the game's DLSS guides when
 // a capture matches the present, neutral ones otherwise), 1 = Required (no
 // capture, no NR), 2 = Never (neutral guides always).
@@ -1738,6 +1743,7 @@ inline constexpr uint32_t kHookPresent = 2;
 inline std::atomic_uint32_t hook_point = defaults::kHookPoint;
 // Routing state is protected by runtime_mutex; the atomic is a UI snapshot.
 inline std::atomic_bool auto_present_fallback = defaults::kAutoPresentFallback;
+inline std::atomic<float> auto_present_intensity = defaults::kAutoPresentIntensity;
 inline std::atomic_bool auto_present_fallback_active{false};
 inline PresentFallback auto_present_state;
 enum class AutoPresentWait : uint8_t { kBuffers, kRecordings, kAmbiguous, kFrameGeneration, kPaused };
@@ -6600,7 +6606,8 @@ inline bool EnsureNrFeature(
 
 inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
                                uint64_t chain_reset_epoch, uint32_t create_flags,
-                               int32_t frame_reset, bool frame_ui_correction);
+                               int32_t frame_reset, bool frame_ui_correction,
+                               std::optional<float> intensity_override = std::nullopt);
 inline void SetEvaluationParameters(
     FeatureState& state,
     NrFeatureSlot& slot,
@@ -6682,7 +6689,7 @@ inline void SetEvaluationParameters(
     NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.JitterOffsetY", frame.jitter_y);
   }
   SetModelParameters(slot, slot_index, chain_reset_epoch, frame.create_flags,
-                     frame.frame_reset, frame.ui_correction);
+                     frame.frame_reset, frame.ui_correction, frame.intensity_override);
 }
 
 // The depth convention, the reset and the model steering of one evaluate:
@@ -6691,7 +6698,8 @@ inline void SetEvaluationParameters(
 // (vulkan_path.hpp), so both send the Look section the same way.
 inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
                                uint64_t chain_reset_epoch, uint32_t create_flags,
-                               int32_t frame_reset, bool frame_ui_correction) {
+                               int32_t frame_reset, bool frame_ui_correction,
+                               std::optional<float> intensity_override) {
   NVSDK_NGX_Parameter* parameters = slot.parameters;
   bool depth_inverted =
       (create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
@@ -6724,7 +6732,9 @@ inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.Reset", do_reset ? 1 : 0);
   slot.model_reset = do_reset;
   NVSDK_NGX_Parameter_SetF(
-      parameters, "DLSSNR.Intensity", PassIntensity(slot_index));
+      parameters, "DLSSNR.Intensity",
+      slot_index == 0 && intensity_override.has_value()
+          ? *intensity_override : PassIntensity(slot_index));
   // The model steering: the Look section's values, or a stack pass's own
   // once its "Same as pass 1" is off (group G).  Each is read once, so the
   // log line below names exactly what this evaluate sent.
@@ -9429,6 +9439,7 @@ inline bool ProcessInline(
       &feature, "after", frame, motion_window, scale_source, motion_desc, &output_rect,
       resource_width, resource_height);
   frame.ui_correction = present != nullptr && present->ui_correction;
+  if (present != nullptr) frame.intensity_override = present->intensity_override;
 
   // One gain snapshot for the whole frame's encode, decode, and black
   // restore.  SDR worksets run the legacy codec family: Classic uses the
@@ -19060,6 +19071,9 @@ inline constexpr Setting kSetHookPoint{
 inline constexpr Setting kSetAutoPresentFallback{
     "NRAutoPresentFallback", &auto_present_fallback, defaults::kAutoPresentFallback,
     SettingEffect::kHistory};
+inline constexpr Setting kSetAutoPresentIntensity{
+    "NRAutoPresentIntensity", &auto_present_intensity, defaults::kAutoPresentIntensity,
+    SettingEffect::kHistory};
 // The Present hook point's own settings (present_path.hpp).  The guides, the
 // encoding, the white level and the UI correction change what the model
 // sees, so they restart its history; which presents run it does not.
@@ -19381,7 +19395,8 @@ inline constexpr const Setting* kLookResultSettings[] = {
 // point lit "Reset performance" on a section whose rows were all stock, and
 // the link reset a control drawn outside it.
 inline constexpr const Setting* kHookPointSettings[] = {
-    &kSetHookPoint,    &kSetAutoPresentFallback, &kSetPresentGuides, &kSetPresentEncoding,
+    &kSetHookPoint,    &kSetAutoPresentFallback, &kSetAutoPresentIntensity,
+    &kSetPresentGuides, &kSetPresentEncoding,
     &kSetPresentWhite, &kSetPresentUiCorrection, &kSetPresentFrames, &kSetPresentFgSource};
 inline constexpr const Setting* kPerformanceSettings[] = {
     &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample};
@@ -20029,6 +20044,12 @@ inline void DrawSectionHookPoint(const ui::PanelText& text) {
         " with neutral depth/motion. Resets history when DLSS resumes. Requires one"
         " presenting swapchain and no frame generation. Game UI is part of the input.");
     if (auto_present_fallback.load()) {
+      SliderSetting(
+          text, kSetAutoPresentIntensity, "Fallback Intensity", 0.f, 2.f, "%.2f",
+          "Intensity only while automatic Present fallback is processing menus or video."
+          " Upscaled and manually selected Present keep the main Intensity setting."
+          " Like the main slider, this controls stack pass 1; additional passes keep"
+          " their own intensity. All other preset settings are unchanged.");
       const char* status = "Upscaled; draining swapchain buffers";
       switch (auto_present_wait.load(std::memory_order_relaxed)) {
         case AutoPresentWait::kRecordings: status = "Upscaled; waiting for DLSS command lists to retire"; break;
@@ -21163,6 +21184,7 @@ inline std::string BuildSupportReport() {
          << "\n"
          << "settings: NeuralUplift=" << enabled.load()
          << " NRIntensity=" << intensity.load()
+         << " NRAutoPresentIntensity=" << auto_present_intensity.load()
          << " NRPasses=" << stack_passes.load()
          << " NRPreUpscale=" << nr_before_upscale.load()
          << " NRCodecMode=" << codec_mode.load()
@@ -22160,6 +22182,7 @@ inline void LoadConfiguration() {
   bool saved_enabled = defaults::kEnabled;
   bool saved_pre_upscale = defaults::kPreSr;
   bool saved_auto_present_fallback = defaults::kAutoPresentFallback;
+  float saved_auto_present_intensity = defaults::kAutoPresentIntensity;
   uint32_t saved_present_guides = defaults::kPresentGuides;
   uint32_t saved_present_encoding = defaults::kPresentEncoding;
   float saved_present_white = defaults::kPresentWhiteNits;
@@ -22269,6 +22292,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "NRPresentMVecUnits", saved_present_mvec_units);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRAutoPresentFallback", saved_auto_present_fallback);
+  reshade::get_config_value(
+      nullptr, kConfigSection, "NRAutoPresentIntensity", saved_auto_present_intensity);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRAutoFgFallback", saved_auto_fg_fallback);
   reshade::get_config_value(
@@ -22829,6 +22854,9 @@ inline void LoadConfiguration() {
       saved_detail_stability, defaults::kDetailStability, 0u, 2u, "NRDetailStability");
   enabled = saved_enabled;
   auto_present_fallback = saved_auto_present_fallback;
+  auto_present_intensity = SanitizeFloatKey(
+      saved_auto_present_intensity, defaults::kAutoPresentIntensity, 0.f, 2.f,
+      "NRAutoPresentIntensity");
   hook_point = SanitizeEnumKey(
       saved_hook_point, defaults::kHookPoint, 0u, 2u, "NRHookPoint");
   present_guides = SanitizeEnumKey(

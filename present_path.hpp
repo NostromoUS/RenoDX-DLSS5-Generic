@@ -3185,6 +3185,9 @@ inline void RunPresentPath(
     // lock remain held through recording AND queue submission.
     SetAutoPresentFallbackActive(true);
     auto_present_handle = stream.Handle();
+    // Snapshot after any GPU-slot wait. Only this accepted fallback frame
+    // gets the override; the main setting and manual Present stay untouched.
+    target.intensity_override = auto_present_intensity.load();
   }
   {
     const EvaluateChainScope chain_scope;
