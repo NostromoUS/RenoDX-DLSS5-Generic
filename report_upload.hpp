@@ -55,7 +55,10 @@
 #pragma comment(lib, "winhttp.lib")
 // Loaded on the first upload, not into every game at start.
 #pragma comment(lib, "delayimp.lib")
+// lld requires this option on its command line; build-addon.ps1 supplies it.
+#if !defined(__clang__)
 #pragma comment(linker, "/DELAYLOAD:winhttp.dll")
+#endif
 
 namespace renodx::addons::dlss5::report {
 
