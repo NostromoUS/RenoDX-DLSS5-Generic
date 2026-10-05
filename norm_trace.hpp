@@ -54,7 +54,7 @@
 
 #include <include/reshade.hpp>
 
-#include "../../utils/directx.hpp"
+#include "native_identity.hpp"
 #include "gpu_lease.hpp"
 #include "submission_tracker.hpp"
 
@@ -241,7 +241,7 @@ inline GpuLeaseState SlotProof(const Slot& slot, bool exact_proofs, GpuLeaseStat
 }
 
 inline bool Ensure(ID3D12Device* device) {
-  IUnknown* const identity = renodx::utils::directx::NativeIdentity(device);
+  IUnknown* const identity = renodx::addons::dlss5::native_identity::Get(device);
   if (context_device == identity) return readback != nullptr;
   Release();
   if (!CreateMappedReadback(device, kSlotStride * kSlots, &readback, &mapped)) return false;
@@ -564,7 +564,7 @@ inline void Record(
     uint64_t generation) {
   if (generation < next_generation || norm_scale == nullptr) return;
   next_generation = generation + kEvery;
-  IUnknown* const identity = renodx::utils::directx::NativeIdentity(device);
+  IUnknown* const identity = renodx::addons::dlss5::native_identity::Get(device);
   if (context_device != identity) {
     Release();
     if (!internal::CreateMappedReadback(device, kSlots * kPlacementAlign, &readback, &mapped)) {

@@ -189,7 +189,7 @@ inline std::atomic<BridgeState> bridge_state{BridgeState::kDown};
 // The bridge objects exist (state up or lost) - the swapchain teardown's
 // "is there anything to release" question.
 inline std::atomic_bool bridge_device_live{false};
-// The native COM identity (utils::directx::NativeIdentity) of the game's
+// The native COM identity (native_identity::Get) of the game's
 // D3D11 device while the bridge serves it: what the destroy_swapchain and
 // destroy_device handlers match against, on whatever thread they run.  A
 // value to compare, never dereferenced, so a teardown racing ReleaseBridge
@@ -601,7 +601,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     ID3D11Device* owner = nullptr;
     textures[key(copied)]->GetDevice(&owner);
     if (failure == nullptr
-        && !renodx::utils::directx::SameNativeObject(owner, bridge.device11_base)) {
+        && !renodx::addons::dlss5::native_identity::Same(owner, bridge.device11_base)) {
       failure = copied == ResourceKey::kOutput
                     ? "the DLSS output lives on a different D3D11 device than the"
                       " context that evaluated it"
@@ -613,10 +613,10 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
       char text[160];
       std::snprintf(text, sizeof(text),
                     "; native identities: surface=%p reported=%p context=%p",
-                    static_cast<void*>(renodx::utils::directx::NativeIdentity(owner)),
+                    static_cast<void*>(renodx::addons::dlss5::native_identity::Get(owner)),
                     static_cast<void*>(owner),
                     static_cast<void*>(
-                        renodx::utils::directx::NativeIdentity(bridge.device11_base)));
+                        renodx::addons::dlss5::native_identity::Get(bridge.device11_base)));
       identities = text;
     }
     ReleaseCom(owner);
@@ -735,7 +735,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
     ID3D11Device* owner = nullptr;
     textures[key(ResourceKey::kExposureTexture)]->GetDevice(&owner);
     const bool same_device =
-        renodx::utils::directx::SameNativeObject(owner, bridge.device11_base);
+        renodx::addons::dlss5::native_identity::Same(owner, bridge.device11_base);
     ReleaseCom(owner);
     bool made = false;
     if (same_device && exposure.SampleDesc.Count == 1) {
@@ -1190,7 +1190,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
     bridge_next_attempt_present = 0;
   }
   bridge_device11_identity.store(
-      renodx::utils::directx::NativeIdentity(bridge.device11_base),
+      renodx::addons::dlss5::native_identity::Get(bridge.device11_base),
       std::memory_order_release);
   bridge_device_live.store(true, std::memory_order_release);
   bridge_ever_live.store(true, std::memory_order_relaxed);

@@ -67,7 +67,7 @@
 
 #include <include/reshade.hpp>
 
-#include "../../utils/directx.hpp"
+#include "native_identity.hpp"
 #include "gpu_lease.hpp"
 #include "look_stage.hpp"
 #include "submission_tracker.hpp"
@@ -198,7 +198,7 @@ inline void Release() {
 }
 
 inline bool Ensure(ID3D12Device* device) {
-  IUnknown* const identity = renodx::utils::directx::NativeIdentity(device);
+  IUnknown* const identity = renodx::addons::dlss5::native_identity::Get(device);
   if (context_device == identity) return readback != nullptr;
   Release();
   D3D12_HEAP_PROPERTIES heap{};

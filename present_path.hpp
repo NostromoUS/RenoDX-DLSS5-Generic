@@ -511,6 +511,9 @@ struct AutoFgObservation {
   const void* swapchain = nullptr;
 };
 inline AutoFgObservation auto_fg_observation;
+// Sticky until device teardown: SR absence is not a safe ownership signal
+// when generated frames can still carry earlier inline NR.
+inline bool auto_present_frame_generation_seen = false;
 // Last admitted owner for a nonblocking Present observation. It is compared
 // only; RunPresentPath revalidates the locked state before recording work.
 inline std::atomic<const void*> auto_fg_fallback_swapchain{nullptr};
@@ -644,6 +647,11 @@ inline void RetirePresentStream(const void* swapchain) {
   const auto it = present_streams.find(swapchain);
   if (it == present_streams.end()) return;
   PresentStream& stream = it->second;
+  if (auto_present_state.owner.swapchain == swapchain) {
+    SetAutoPresentFallbackActive(false);
+    auto_present_state.Reset();
+    auto_present_handle = nullptr;
+  }
   if (const auto feature = features.find(stream.Handle()); feature != features.end()) {
     ReleaseAllNrSlots(feature->second, true);
     features.erase(feature);
@@ -747,6 +755,11 @@ inline bool ReleasePresentPath() {
     ReleaseCom(stream.neutral_depth11);
   }
   present_streams.clear();
+  SetAutoPresentFallbackActive(false);
+  auto_present_state.Reset();
+  auto_present_inline_handle = nullptr;
+  auto_present_handle = nullptr;
+  auto_present_frame_generation_seen = false;
   present_fg_declaration = {};
   auto_fg_observation = {};
   auto_fg_fallback_active.store(false, std::memory_order_relaxed);
@@ -1007,7 +1020,7 @@ inline void CapturePresentGuides(
   if (target == nullptr) return;
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
-  const void* const device_identity = renodx::utils::directx::NativeIdentity(device);
+  const void* const device_identity = renodx::addons::dlss5::native_identity::Get(device);
   // Reallocation may succeed for only one guide. Until both copies are
   // recorded and StampPresentCapture publishes them, this slot is not a
   // readable capture, even if it previously held a completed older frame.
@@ -1149,7 +1162,7 @@ inline void CapturePresentGuides11(
   ID3D11Device* device = nullptr;
   native->GetDevice(&device);
   if (device == nullptr) return;
-  const void* const device_identity = renodx::utils::directx::NativeIdentity(device);
+  const void* const device_identity = renodx::addons::dlss5::native_identity::Get(device);
   target->serial = 0;
   const auto ensure_clone = [&](ID3D11Texture2D** clone, const D3D11_TEXTURE2D_DESC& source) {
     if (*clone != nullptr) {
@@ -1732,7 +1745,7 @@ inline const void* StreamlineBaseIdentity(IUnknown* device) {
       || base == nullptr) {
     return nullptr;
   }
-  const void* const identity = renodx::utils::directx::NativeIdentity(base);
+  const void* const identity = renodx::addons::dlss5::native_identity::Get(base);
   base->Release();
   return identity;
 }
@@ -1764,7 +1777,7 @@ inline bool UpdateAutoFgFallback(
   }
   PresentStream& stream = present_streams[swapchain];
   auto* const native_device = reinterpret_cast<IUnknown*>(queue->get_device()->get_native());
-  if (const void* const identity = renodx::utils::directx::NativeIdentity(native_device);
+  if (const void* const identity = renodx::addons::dlss5::native_identity::Get(native_device);
       stream.device_identity != identity) {
     stream.device_identity = identity;
     stream.streamline_identity = StreamlineBaseIdentity(native_device);
@@ -1812,7 +1825,7 @@ inline void ObservePresentDlssEvaluate(const NVSDK_NGX_Parameter* parameters) {
   if (output == nullptr || auto_fg_observation.device == nullptr) return;
   ID3D12Device* device = nullptr;
   if (FAILED(output->GetDevice(IID_PPV_ARGS(&device)))) return;
-  if (renodx::utils::directx::NativeIdentity(device) == auto_fg_observation.device) {
+  if (renodx::addons::dlss5::native_identity::Get(device) == auto_fg_observation.device) {
     auto_fg_observation.evaluates = 0;
     auto_fg_observation.swapchain = nullptr;
     // Every return is logged, like every switch: rc1 logs showed back-to-back
@@ -1830,12 +1843,14 @@ inline void ObservePresentDlssEvaluate(const NVSDK_NGX_Parameter* parameters) {
 // list or an explicit pre-FG opt-out still declares its rate. Both outermost
 // NGX evaluate wrappers call this under runtime_mutex.
 inline void ObservePresentFrameGeneration(const NVSDK_NGX_Parameter* parameters) {
+  auto_present_frame_generation_seen = true;
+  ObserveAutoPresentEvaluate();
   ID3D12Resource* const backbuffer =
       PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer);
   if (backbuffer == nullptr) return;
   ID3D12Device* device = nullptr;
   if (FAILED(backbuffer->GetDevice(IID_PPV_ARGS(&device)))) return;
-  const void* const identity = renodx::utils::directx::NativeIdentity(device);
+  const void* const identity = renodx::addons::dlss5::native_identity::Get(device);
   ReleaseCom(device);
   const D3D12_RESOURCE_DESC desc = backbuffer->GetDesc();
   const DXGI_FORMAT format = ConcreteResourceFormat(desc.Format);
@@ -1874,7 +1889,8 @@ inline void ObservePresentFrameGeneration(const NVSDK_NGX_Parameter* parameters)
 // game's DLSSG.HUDLess when the stand-in replaced it (RestorePresentPreFg).
 inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
                                        const NVSDK_NGX_Parameter* parameters) {
-  if (!PresentHookServes() || command_list == nullptr) return nullptr;
+  if ((!PresentHookServes(false) && !auto_fg_fallback_active.load(std::memory_order_relaxed))
+      || command_list == nullptr) return nullptr;
   if (screenshot::WantsFinalPresent()) {
     // F5 compares one final image; do not enhance the FG input or HUD-less
     // image first, then mislabel that already-enhanced source as NR off.
@@ -1938,7 +1954,7 @@ inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
   ID3D12Device* frame_device = nullptr;
   const void* frame_identity = nullptr;
   if (SUCCEEDED(backbuffer->GetDevice(IID_PPV_ARGS(&frame_device)))) {
-    frame_identity = renodx::utils::directx::NativeIdentity(frame_device);
+    frame_identity = renodx::addons::dlss5::native_identity::Get(frame_device);
     ReleaseCom(frame_device);
   }
   const void* owner = nullptr;
@@ -2363,7 +2379,58 @@ inline void RunPresentPath(
       }
     }
   }
-  if (!PresentHookServes(false) && !auto_fallback) {
+  bool sr_fallback = false;
+  PresentFallback::Surface fallback_surface;
+  uint64_t fallback_ticket = 0;
+  {
+    // ReShade owns the presenting queue lock. A missed observation must not
+    // block behind an evaluate that could need that queue.
+    RuntimeTryLock fallback_lock(runtime_mutex);
+    if (fallback_lock.owns_lock()) {
+      if (!AutoPresentFallbackSelected()) {
+        SetAutoPresentFallbackActive(false);
+        auto_present_state.Reset();
+      } else if (queue != nullptr && swapchain != nullptr
+                 && swapchain->get_device() != nullptr
+                 && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) {
+        auto* const resource = reinterpret_cast<ID3D12Resource*>(
+            static_cast<uintptr_t>(swapchain->get_current_back_buffer().handle));
+        if (resource != nullptr) {
+          const auto desc = resource->GetDesc();
+          fallback_surface = {
+              .swapchain = swapchain,
+              .device = renodx::addons::dlss5::native_identity::Get(
+                  reinterpret_cast<IUnknown*>(swapchain->get_device()->get_native())),
+              .width = static_cast<uint32_t>(desc.Width),
+              .height = desc.Height,
+              .format = static_cast<uint32_t>(desc.Format),
+              .buffers = swapchain->get_back_buffer_count(),
+          };
+          uint32_t index = fallback_surface.buffers;
+          for (uint32_t i = 0; i < fallback_surface.buffers && i < 64; ++i) {
+            if (swapchain->get_back_buffer(i).handle == swapchain->get_current_back_buffer().handle) {
+              index = i;
+              break;
+            }
+          }
+          if (!(auto_present_state.owner == fallback_surface)) SetAutoPresentFallbackActive(false);
+          const bool recordings_complete = submission::ResourceReleasable(&auto_present_state);
+          const bool allowed = hooks_enabled.load(std::memory_order_relaxed)
+              && !auto_fallback && !screenshot::IsArmed() && !NrYieldsToForeign()
+              && !teardown_pending.load(std::memory_order_acquire);
+          sr_fallback = auto_present_state.ObservePresent(
+              fallback_surface, index, allowed && recordings_complete && !auto_present_frame_generation_seen);
+          const auto reason = (auto_present_state.ambiguous ? AutoPresentWait::kAmbiguous
+              : auto_present_frame_generation_seen ? AutoPresentWait::kFrameGeneration
+              : !allowed ? AutoPresentWait::kPaused
+              : !recordings_complete ? AutoPresentWait::kRecordings : AutoPresentWait::kBuffers);
+          auto_present_wait.store(reason, std::memory_order_relaxed);
+          fallback_ticket = auto_present_state.revision;
+        }
+      }
+    }
+  }
+  if (!PresentHookServes(false) && !auto_fallback && !sr_fallback) {
     if (screenshot::HasPending()
         || screenshot::internal::retained_sets.load(std::memory_order_relaxed) != 0) {
       // The one-shot comparison restored the inline hook after recording
@@ -2374,7 +2441,8 @@ inline void RunPresentPath(
       RuntimeTryLock lock(runtime_mutex);
       if (lock.owns_lock()) ReleasePresentRing();
     } else if (const int64_t served = present_served_ns.load(std::memory_order_relaxed);
-               served != 0 && SteadyNowNs() - served >= kWorksetIdleRetireNs) {
+               !AutoPresentFallbackSelected()
+               && served != 0 && SteadyNowNs() - served >= kWorksetIdleRetireNs) {
       RuntimeTryLock lock(runtime_mutex);
       if (lock.owns_lock() && RetireIdlePresentPath()) {
         present_served_ns.store(0, std::memory_order_relaxed);
@@ -2605,13 +2673,19 @@ inline void RunPresentPath(
   // here too: holding runtime_mutex while waiting for a game's NGX call makes
   // that call wait for us, and the bounded timeout sends an unenhanced frame
   // between enhanced ones (GoWR v8.0.3: gaps=113, ngx_busy=113, slot_timeouts=0).
-  std::optional<ngx_serial::PresentTurn> ngx_turn(std::in_place);
+  std::optional<ngx_serial::PresentTurn> ngx_turn(std::in_place, sr_fallback);
   // Optional because Direct3D 11 hands the frame to the bridge, which takes
   // runtime_mutex itself and may bring the bridge up outside it.
   std::optional<RuntimeLock> lock(std::in_place, runtime_mutex);
   // A DLSS evaluate can resume while this present waits for its NGX turn.
   // The selected inline path owns that frame again; do not enhance it twice.
   const auto auto_owner_current = [&] {
+    if (sr_fallback) {
+      return AutoPresentFallbackSelected() && !auto_present_frame_generation_seen
+          && !screenshot::IsArmed()
+          && auto_present_state.IsCurrent(fallback_surface, fallback_ticket)
+          && submission::ResourceReleasable(&auto_present_state);
+    }
     return !auto_fallback || PresentHookServes(false)
         || (auto_fg_fallback_active.load(std::memory_order_relaxed)
             && auto_fg_observation.swapchain == swapchain);
@@ -2649,7 +2723,7 @@ inline void RunPresentPath(
     // when the runtime is not up yet - the world the game's own lists are in.
     ID3D12Device* face = nullptr;
     if (direct_device != nullptr
-        && renodx::utils::directx::SameNativeObject(
+        && renodx::addons::dlss5::native_identity::Same(
             direct_device, reinterpret_cast<IUnknown*>(api_device->get_native()))) {
       face = direct_device;
       face->AddRef();
@@ -2701,7 +2775,7 @@ inline void RunPresentPath(
   };
   if (stream.device_identity == nullptr) {
     auto* const native_device = reinterpret_cast<IUnknown*>(api_device->get_native());
-    stream.device_identity = renodx::utils::directx::NativeIdentity(native_device);
+    stream.device_identity = renodx::addons::dlss5::native_identity::Get(native_device);
     stream.streamline_identity = StreamlineBaseIdentity(native_device);
   }
   stream.backbuffer_width = back_width;
@@ -2818,7 +2892,7 @@ inline void RunPresentPath(
           lock.reset();
           ngx_turn.reset();
           completed = WaitForSingleObject(event, kPresentSlotWaitMs) == WAIT_OBJECT_0;
-          ngx_turn.emplace();
+          ngx_turn.emplace(sr_fallback);
           lock.emplace(runtime_mutex);
         }
         CloseHandle(event);
@@ -2864,8 +2938,10 @@ inline void RunPresentPath(
   auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
   const bool comparing_clean_frame = screenshot::WantsFinalPresent()
       && screenshot::internal::requires_passthrough_frame.load(std::memory_order_acquire);
-  const uint32_t guides_mode = comparing_clean_frame
-      ? kPresentGuidesRequired : present_guides.load();
+  // SR inactivity must never reuse gameplay captures (Optional allows them
+  // for up to 250 ms). Videos have no corresponding depth, motion or jitter.
+  const uint32_t guides_mode = sr_fallback ? kPresentGuidesNever
+      : (comparing_clean_frame ? kPresentGuidesRequired : present_guides.load());
   uint64_t comparison_serial = 0;
   if (comparing_clean_frame) {
     for (const PresentGuideSet& set : present_guide_sets) {
@@ -3104,6 +3180,12 @@ inline void RunPresentPath(
   // Our own list has no host state for the restore-target gate to wait on.
   gate_ever_opened.store(true, std::memory_order_relaxed);
   bool touched = false;
+  if (sr_fallback) {
+    // Rechecked after every unlocked wait above; the NGX turn and runtime
+    // lock remain held through recording AND queue submission.
+    SetAutoPresentFallbackActive(true);
+    auto_present_handle = stream.Handle();
+  }
   {
     const EvaluateChainScope chain_scope;
     const int64_t started_ns = SteadyNowNs();

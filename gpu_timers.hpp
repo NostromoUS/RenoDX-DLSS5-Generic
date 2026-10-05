@@ -36,7 +36,7 @@
 
 #include <include/reshade.hpp>
 
-#include "../../utils/directx.hpp"
+#include "native_identity.hpp"
 #include "gpu_lease.hpp"
 #include "submission_tracker.hpp"
 
@@ -137,7 +137,7 @@ namespace internal {
 inline Segment segments[kSegmentDepth];
 inline uint32_t head = 0;  // next segment Begin will claim
 inline uint32_t tail = 0;  // oldest segment awaiting its proof
-// The device's native identity (utils::directx::NativeIdentity), compared
+// The device's native identity (native_identity::Get), compared
 // only.  The raw pointer is whichever face the evaluate's list reports -
 // ReShade's device proxy or the native device - and a change of face is not a
 // change of device: releasing the query heap there would free it under a
@@ -183,7 +183,7 @@ inline void Release() {
 }
 
 inline bool Ensure(ID3D12Device* device) {
-  IUnknown* const identity = renodx::utils::directx::NativeIdentity(device);
+  IUnknown* const identity = renodx::addons::dlss5::native_identity::Get(device);
   if (context_device == identity) return heap != nullptr;
   Release();
   D3D12_QUERY_HEAP_DESC heap_desc{};

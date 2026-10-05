@@ -63,10 +63,10 @@
 // came first, or every ImGui call in this TU resolves to nothing.
 #include "lastgasp.hpp"
 
-#include "../../utils/directx.hpp"
+#include "native_identity.hpp"
 #include "../../utils/float16.hpp"
 #include "../../utils/path.hpp"
-#include "../../utils/vtable.hpp"
+#include "detour_transaction.hpp"
 #include "arg_plausibility.hpp"
 #include "bridge_params.hpp"
 #include "cmd_slots.hpp"
@@ -76,6 +76,7 @@
 #include "direct_call.hpp"
 #include "gpu_lease.hpp"
 #include "present_cadence.hpp"
+#include "present_fallback.hpp"
 #include "reset_epoch.hpp"
 #include "root_arguments.hpp"
 #include "runtime_lock.hpp"
@@ -164,7 +165,7 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default into every file, so a stored 1 at schema 6 is inherited, not
 // chosen.
 constexpr uint32_t kConfigVersion = 7;
-constexpr char kAddonVersion[] = "v8.5.0-rc10";
+constexpr char kAddonVersion[] = "v8.5.0-rc10-aw-fallback1";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -1372,7 +1373,7 @@ inline HMODULE ngx_slot_module[kMaxNgxSlots] = {};
 // therefore still costs two log lines and a map lookup, and a module whose
 // install failed once gets another go.  The one cause measured so far was
 // this addon's own: two of its threads contending for its statically
-// linked copy of Detours (v6.8.0-alpha31, see vtable::TransactionMutex).
+// linked copy of Detours (v6.8.0-alpha31, see detour_transaction::TransactionMutex).
 // runtime_mutex-guarded like the slot table; cleared in Shutdown
 // alongside it.
 struct NgxHookRetry {
@@ -1438,6 +1439,7 @@ inline constexpr bool kPreSr = false;
 // NRHookPoint (rc11): 0 = Upscaled (the after path, the default), 1 = Render
 // (pre-SR), 2 = Present (present_path.hpp).
 inline constexpr uint32_t kHookPoint = 0;
+inline constexpr bool kAutoPresentFallback = false;
 // The Present hook point's guides: 0 = Optional (the game's DLSS guides when
 // a capture matches the present, neutral ones otherwise), 1 = Required (no
 // capture, no NR), 2 = Never (neutral guides always).
@@ -1734,6 +1736,20 @@ inline constexpr uint32_t kHookUpscaled = 0;
 inline constexpr uint32_t kHookRender = 1;
 inline constexpr uint32_t kHookPresent = 2;
 inline std::atomic_uint32_t hook_point = defaults::kHookPoint;
+// Routing state is protected by runtime_mutex; the atomic is a UI snapshot.
+inline std::atomic_bool auto_present_fallback = defaults::kAutoPresentFallback;
+inline std::atomic_bool auto_present_fallback_active{false};
+inline PresentFallback auto_present_state;
+enum class AutoPresentWait : uint8_t { kBuffers, kRecordings, kAmbiguous, kFrameGeneration, kPaused };
+inline std::atomic<AutoPresentWait> auto_present_wait{AutoPresentWait::kBuffers};
+inline const NVSDK_NGX_Handle* auto_present_inline_handle = nullptr;
+inline const NVSDK_NGX_Handle* auto_present_handle = nullptr;
+inline bool AutoPresentFallbackSelected() {
+  return auto_present_fallback.load(std::memory_order_relaxed)
+      && enabled.load(std::memory_order_relaxed)
+      && hook_point.load(std::memory_order_relaxed) == kHookUpscaled
+      && !D3D11OnlySession() && !vulkan_present_seen.load(std::memory_order_relaxed);
+}
 inline std::atomic_uint32_t auto_fg_fallback = defaults::kAutoFgFallback;
 inline std::atomic_bool auto_fg_fallback_active{false};
 // The pre-SR selection as the evaluate paths ask for it: a view of
@@ -1764,6 +1780,8 @@ inline bool PresentHookServes(bool include_auto = true) {
   // keep Upscaled (vulkan_path.hpp counts vk[present_fallback=]).
   return (hook_point.load(std::memory_order_relaxed) == kHookPresent
           || (include_auto && auto_fg_fallback_active.load(std::memory_order_relaxed))
+          || (include_auto && AutoPresentFallbackSelected()
+              && auto_present_fallback_active.load(std::memory_order_relaxed))
           || screenshot::WantsFinalPresent())
          && !vulkan_present_seen.load(std::memory_order_relaxed)
          && (!D3D11OnlySession() || Dx11NativeRoute());
@@ -2659,7 +2677,7 @@ inline bool NrWaitsForTeardown(ID3D12GraphicsCommandList* command_list) {
       && SUCCEEDED(command_list->GetDevice(IID_PPV_ARGS(&device)))
       && device != nullptr) {
     same_device =
-        renodx::utils::directx::SameNativeObject(direct_device, device);
+        renodx::addons::dlss5::native_identity::Same(direct_device, device);
     device->Release();
   }
   if (!same_device) {
@@ -4122,6 +4140,13 @@ inline int64_t workset_idle_exempt_ns = 0;
 inline void ReleaseAllNrSlots(FeatureState& state, bool retire);
 inline void RetireSupersededWorksets(int64_t now_ns) {
   for (auto it = worksets.begin(); it != worksets.end();) {
+    // Keep the two most recently used hybrid streams warm. The ordinary
+    // workset cap, contract changes and teardown still retire their resources.
+    if (AutoPresentFallbackSelected()
+        && (it->first.handle == auto_present_inline_handle || it->first.handle == auto_present_handle)) {
+      ++it;
+      continue;
+    }
     if (it->first.handle == workset_idle_exempt_handle
         && now_ns - workset_idle_exempt_ns < 1'000'000'000) {
       ++it;
@@ -4690,7 +4715,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     //     replayable releases are.  A pending proof (work unsubmitted or
     //     unfinished) is never given up here: it stays a retry.
     const bool same_device =
-        renodx::utils::directx::SameNativeObject(direct_device, device);
+        renodx::addons::dlss5::native_identity::Same(direct_device, device);
     ID3D12Device* native_face = device;
     const bool proxy_face =
         renodx::utils::directx::NativeFromReShadeProxy(&native_face);
@@ -8820,6 +8845,26 @@ __declspec(noinline) inline void SetPresentCaptureMeta(
   screenshot::SetPendingDiagnosticMeta(meta.str());
 }
 
+// Caller holds runtime_mutex. Path changes reset model and normalization
+// history through the epoch without recreating either stream's feature.
+inline void SetAutoPresentFallbackActive(bool active) {
+  if (auto_present_fallback_active.exchange(active, std::memory_order_relaxed) != active) {
+    RequestHistoryReset();
+    Log(reshade::log::level::info,
+        active ? "Automatic Present fallback: DLSS work drained; using neutral guides on the final frame"
+               : "Automatic Present fallback: returning to Upscaled; temporal history reset");
+  }
+  auto_present_state.active = active;
+}
+
+// Successful game SR/RR evaluations invalidate a pending Present ticket even
+// when inline NR later declines. Nested NGX mirrors may invalidate it again;
+// admission needs inactivity, not an exact number of game frames.
+inline void ObserveAutoPresentEvaluate() {
+  SetAutoPresentFallbackActive(false);
+  auto_present_state.ObserveEvaluate();
+}
+
 inline bool ProcessInline(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
@@ -9222,7 +9267,16 @@ inline bool ProcessInline(
   const bool setup_ok = workset != nullptr;
   // Exact submission-use proof (issue 01): this evaluate's recordings on the
   // game's list can reference the workset's GPU objects.
-  if (setup_ok) TrackWorksetRecording(command_list, *workset);
+  if (setup_ok) {
+    TrackWorksetRecording(command_list, *workset);
+    if (present == nullptr) {
+      // A stable marker shares the existing workset's recording lifetime.
+      // Track even while the option is off, so enabling it cannot overlook
+      // already-recorded inline NR. No GPU commands are added by this marker.
+      submission::TrackUse(command_list, &auto_present_state);
+      auto_present_inline_handle = handle;
+    }
+  }
   bool capture_this_eval = false;
   if (setup_ok && present != nullptr && present->capture_display
       && screenshot::WantsFinalPresent()) {
@@ -12962,8 +13016,8 @@ inline bool InstallCommandListStateHooks(ID3D12GraphicsCommandList* command_list
       targets[kCmdSlotSetComputeRootUnorderedAccessView];
   real_cmd_execute_indirect = targets[kCmdSlotExecuteIndirect];
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
-  bool detours_installed = renodx::utils::vtable::BeginTransaction();
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
+  bool detours_installed = renodx::addons::dlss5::detour_transaction::BeginTransaction();
   if (detours_installed) {
     DetourUpdateThread(GetCurrentThread());
     detours_installed =
@@ -13096,8 +13150,8 @@ inline void UnhookCommandListStateHooks() {
   std::lock_guard<std::mutex> lock(cmd_hook_mutex);
   if (!cmd_hooks_installed) return;
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
-  bool detours_detached = renodx::utils::vtable::BeginTransaction();
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
+  bool detours_detached = renodx::addons::dlss5::detour_transaction::BeginTransaction();
   if (detours_detached) {
     DetourUpdateThread(GetCurrentThread());
     detours_detached =
@@ -13412,8 +13466,8 @@ inline bool InstallDeviceStateHooks(ID3D12Device* device) {
   bool installed;
   {
     std::lock_guard<std::mutex> transaction(
-        renodx::utils::vtable::TransactionMutex());
-    installed = renodx::utils::vtable::BeginTransaction();
+        renodx::addons::dlss5::detour_transaction::TransactionMutex());
+    installed = renodx::addons::dlss5::detour_transaction::BeginTransaction();
     if (installed) {
       DetourUpdateThread(GetCurrentThread());
       installed = DetourAttach(&real_device_create_command_list,
@@ -13451,8 +13505,8 @@ inline bool InstallDeviceStateHooks(ID3D12Device* device) {
     bool signature_installed;
     {
       std::lock_guard<std::mutex> transaction(
-          renodx::utils::vtable::TransactionMutex());
-      signature_installed = renodx::utils::vtable::BeginTransaction();
+          renodx::addons::dlss5::detour_transaction::TransactionMutex());
+      signature_installed = renodx::addons::dlss5::detour_transaction::BeginTransaction();
       if (signature_installed) {
         DetourUpdateThread(GetCurrentThread());
         signature_installed =
@@ -13502,8 +13556,8 @@ inline void UnhookDeviceStateHooks() {
     bool signature_detached;
     {
       std::lock_guard<std::mutex> transaction(
-          renodx::utils::vtable::TransactionMutex());
-      signature_detached = renodx::utils::vtable::BeginTransaction();
+          renodx::addons::dlss5::detour_transaction::TransactionMutex());
+      signature_detached = renodx::addons::dlss5::detour_transaction::BeginTransaction();
       if (signature_detached) {
         DetourUpdateThread(GetCurrentThread());
         signature_detached =
@@ -13522,8 +13576,8 @@ inline void UnhookDeviceStateHooks() {
   }
   if (!device_hooks_installed) return;
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
-  bool detached = renodx::utils::vtable::BeginTransaction();
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
+  bool detached = renodx::addons::dlss5::detour_transaction::BeginTransaction();
   if (detached) {
     DetourUpdateThread(GetCurrentThread());
     detached = DetourDetach(&real_device_create_command_list,
@@ -13572,7 +13626,7 @@ inline bool queue_hook_installed = false;
 // The install is retried, not attempted once.  Until v6.8.0-alpha30 a
 // single failure - another of this addon's own threads holding the
 // Detours transaction was enough, since Detours keeps one per linked copy
-// (see vtable::TransactionMutex, alpha31) - set an `attempted` flag that
+// (see detour_transaction::TransactionMutex, alpha31) - set an `attempted` flag that
 // was never cleared, so the queue completion
 // tracker stayed off for the whole session and every workset waited for
 // teardown to be freed.  Same latch shape as the NGX one, in a second
@@ -13807,7 +13861,7 @@ inline bool InstallQueueCompletionHooks(ID3D12CommandQueue* queue) {
   // abort.  It models the real shape: the Detours transaction is
   // process-wide and single-threaded, and this install runs on the
   // present thread while the command-list install runs on the game’s
-  // recording thread - see vtable::TransactionMutex.
+  // recording thread - see detour_transaction::TransactionMutex.
   if (TestQueueHookFailureBudget() != 0 && ConsumeTestQueueHookFailure()) {
     real_queue_execute_command_lists = nullptr;
     ScheduleQueueHookRetry(
@@ -13815,8 +13869,8 @@ inline bool InstallQueueCompletionHooks(ID3D12CommandQueue* queue) {
     return false;
   }
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
-  bool detours_installed = renodx::utils::vtable::BeginTransaction();
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
+  bool detours_installed = renodx::addons::dlss5::detour_transaction::BeginTransaction();
   if (detours_installed) {
     DetourUpdateThread(GetCurrentThread());
     detours_installed =
@@ -13854,8 +13908,8 @@ inline void UnhookQueueCompletionHooks() {
   if (!queue_hook_installed) return;
   queue_tracking_active.store(false, std::memory_order_release);
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
-  bool detours_detached = renodx::utils::vtable::BeginTransaction();
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
+  bool detours_detached = renodx::addons::dlss5::detour_transaction::BeginTransaction();
   if (detours_detached) {
     DetourUpdateThread(GetCurrentThread());
     detours_detached =
@@ -13895,7 +13949,7 @@ inline void UnhookQueueCompletionHooks() {
 // the P3 foreign runs, WITNESS 3.5).  A1 resolves the ExecuteCommandLists
 // vtable from a THROWAWAY NATIVE QUEUE created on the entry's device and
 // runs the existing InstallQueueCompletionHooks: no new install mechanism,
-// the same queue_hook_mutex + vtable::TransactionMutex ordering (alpha31)
+// the same queue_hook_mutex + detour_transaction::TransactionMutex ordering (alpha31)
 // and the same fail-retry backoff (alpha30, presents still flow in a
 // D3D11-presenting process).
 //
@@ -14425,6 +14479,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
     return result;
   }
+  ObserveAutoPresentEvaluate();
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   // Both insertion modes: the pre-SR block above skipped its pass silently.
@@ -14591,6 +14646,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
 
   RuntimeLock lock(runtime_mutex);
   if (!RegisteredDlssEvaluate(handle, parameters)) return result;
+  ObserveAutoPresentEvaluate();
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   if (NrYieldsToForeign()) {
@@ -14987,7 +15043,7 @@ inline void ArmForeignDetourTransaction() {
   const uint32_t ms = TestDetourHoldMs();
   if (ms == 0 || test_detour_hold_started.exchange(true)) return;
   std::thread([ms] {
-    // Deliberately NOT under vtable::TransactionMutex: this is the
+    // Deliberately NOT under detour_transaction::TransactionMutex: this is the
     // foreign holder, which is what the counter is for.
     if (DetourTransactionBegin() != NO_ERROR) return;
     test_detour_hold_owned.store(true, std::memory_order_release);
@@ -15003,11 +15059,11 @@ inline void ArmForeignDetourTransaction() {
     // that never finishes cannot hold the transaction forever; firing it
     // fails the lane's asserts loudly rather than silently passing.
     const uint64_t contended_at_arm =
-        renodx::utils::vtable::transaction_contended.load(
+        renodx::addons::dlss5::detour_transaction::transaction_contended.load(
             std::memory_order_relaxed);
     const auto no_collision_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    while (renodx::utils::vtable::transaction_contended.load(
+    while (renodx::addons::dlss5::detour_transaction::transaction_contended.load(
                std::memory_order_relaxed) == contended_at_arm
            && std::chrono::steady_clock::now() < no_collision_deadline) {
       std::this_thread::yield();
@@ -15517,6 +15573,11 @@ inline sl::Result HookedStreamlineEvaluate(
   if (feature == sl::kFeatureDLSS || feature == sl::kFeatureDLSS_RR) {
     ++intercepted_streamline_dlss_evaluations;
   }
+  // Retain the turn through observation/injection when the hybrid route is
+  // available. Otherwise Present could enter between slEvaluate returning
+  // and its successful SR evaluation being observed below.
+  std::optional<ngx_serial::Call> fallback_turn;
+  if (AutoPresentFallbackSelected()) fallback_turn.emplace();
   const uint64_t nr_before = successful_evaluations.load();
   // Its NGX turn (ngx_serial.hpp): sl.dlss evaluates NGX inside.
   const sl::Result result = ngx_serial::Serialized(real_streamline_evaluate)(
@@ -15560,6 +15621,7 @@ inline sl::Result HookedStreamlineEvaluate(
     command_list->Release();
     return result;
   }
+  ObserveAutoPresentEvaluate();
   const StreamlineCapture capture = BuildStreamlineCapture(frame, inputs, num_inputs);
   ++streamline_direct_fallback_attempts;
   // Same decline-instead-of-pollute gate as the NGX paths.  The list only
@@ -17873,7 +17935,7 @@ inline void EmitTelemetry(int64_t now_ns, bool force = false) {
        << " native_seh_faults="
        << native_seh_faults.load(std::memory_order_relaxed)
        << " detour_contended="
-       << renodx::utils::vtable::transaction_contended.load(
+       << renodx::addons::dlss5::detour_transaction::transaction_contended.load(
               std::memory_order_relaxed)
        << " declines[" << declines_text.str() << "] epochs{game:"
        << history_reset_counts[static_cast<size_t>(HistoryResetSource::kGameReset)]
@@ -18753,7 +18815,7 @@ inline void OnPresent(
   // arms or disarms the NGX serialization first (ngx_serial.hpp): stored
   // before RunPresentPath's turn reads unlocked_in_flight, so a game call
   // either saw it armed and locked, or is counted and drained.
-  ngx_serial::armed.store(PresentHookServes());
+  ngx_serial::armed.store(PresentHookServes() || AutoPresentFallbackSelected());
   GuardHook([&] { RunPresentPath(queue, swapchain, fg_fallback); });
   // And the present ends here: its own NR work (an NR feature create runs
   // 250-600 ms) is not a gap in presents.  Stamped at entry only, the first
@@ -18995,6 +19057,9 @@ inline constexpr Setting kSetUiCorrection{
 // the older on/off key, is read once for migration (LoadConfiguration).
 inline constexpr Setting kSetHookPoint{
     "NRHookPoint", &hook_point, defaults::kHookPoint, SettingEffect::kRecreate};
+inline constexpr Setting kSetAutoPresentFallback{
+    "NRAutoPresentFallback", &auto_present_fallback, defaults::kAutoPresentFallback,
+    SettingEffect::kHistory};
 // The Present hook point's own settings (present_path.hpp).  The guides, the
 // encoding, the white level and the UI correction change what the model
 // sees, so they restart its history; which presents run it does not.
@@ -19316,7 +19381,7 @@ inline constexpr const Setting* kLookResultSettings[] = {
 // point lit "Reset performance" on a section whose rows were all stock, and
 // the link reset a control drawn outside it.
 inline constexpr const Setting* kHookPointSettings[] = {
-    &kSetHookPoint,    &kSetPresentGuides,       &kSetPresentEncoding,
+    &kSetHookPoint,    &kSetAutoPresentFallback, &kSetPresentGuides, &kSetPresentEncoding,
     &kSetPresentWhite, &kSetPresentUiCorrection, &kSetPresentFrames, &kSetPresentFgSource};
 inline constexpr const Setting* kPerformanceSettings[] = {
     &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample};
@@ -19956,6 +20021,26 @@ inline void DrawSectionHookPoint(const ui::PanelText& text) {
   // (PreSrTakes, PresentHookServes, PresentTakesEvaluate).  Through v8.0.2
   // only Raw details and the log said so: the choice looked applied.
   const uint32_t chosen = hook_point.load();
+  if (chosen == kHookUpscaled) {
+    ToggleSetting(
+        text, kSetAutoPresentFallback, "Present fallback without DLSS",
+        "Experimental Direct3D 12 fallback for menus and video. Keeps Upscaled during DLSS;"
+        " after inline work retires and every swapchain buffer passes once, uses Present"
+        " with neutral depth/motion. Resets history when DLSS resumes. Requires one"
+        " presenting swapchain and no frame generation. Game UI is part of the input.");
+    if (auto_present_fallback.load()) {
+      const char* status = "Upscaled; draining swapchain buffers";
+      switch (auto_present_wait.load(std::memory_order_relaxed)) {
+        case AutoPresentWait::kRecordings: status = "Upscaled; waiting for DLSS command lists to retire"; break;
+        case AutoPresentWait::kAmbiguous: status = "Upscaled; multiple presenting streams are ambiguous"; break;
+        case AutoPresentWait::kFrameGeneration: status = "Upscaled; fallback unavailable after frame generation"; break;
+        case AutoPresentWait::kPaused: status = "Upscaled; automatic fallback is paused"; break;
+        case AutoPresentWait::kBuffers: break;
+      }
+      if (auto_present_fallback_active.load()) status = "Present (neutral guides)";
+      ImGui::TextWrapped("Automatic fallback: %s", status);
+    }
+  }
   const char* const fallback =
       chosen == kHookRender && logged_pre_sr_rr.load() ? ui::text::kHookRenderRr
       : chosen == kHookPresent && vulkan_present_seen.load(std::memory_order_relaxed)
@@ -19973,15 +20058,17 @@ inline void DrawSectionHookPoint(const ui::PanelText& text) {
     ImGui::TextColored(ui::tokens::kWarn, "%s", text.Tr(fallback));
     ImGui::PopTextWrapPos();
   }
-  if (chosen == kHookPresent) {
-    constexpr const char* kPresentGuideModes[] = {"Optional", "Required", "Never"};
-    ChoiceSetting(
-        text, kSetPresentGuides, text.Pick("Present Guides", "Depth and motion"),
-        kPresentGuideModes,
-        "Depth and motion for the Present hook point.  Optional: the game's"
-        " DLSS depth and motion when they match the frame, neutral ones"
-        " otherwise.  Required: no NR without them.  Never: always neutral,"
-        " for games without DLSS.");
+  if (chosen == kHookPresent || (chosen == kHookUpscaled && auto_present_fallback.load())) {
+    if (chosen == kHookPresent) {
+      constexpr const char* kPresentGuideModes[] = {"Optional", "Required", "Never"};
+      ChoiceSetting(
+          text, kSetPresentGuides, text.Pick("Present Guides", "Depth and motion"),
+          kPresentGuideModes,
+          "Depth and motion for the Present hook point.  Optional: the game's"
+          " DLSS depth and motion when they match the frame, neutral ones"
+          " otherwise.  Required: no NR without them.  Never: always neutral,"
+          " for games without DLSS.");
+    }
     constexpr const char* kPresentEncodings[] = {"Auto", "SDR", "HDR10", "scRGB"};
     ChoiceSetting(
         text, kSetPresentEncoding, text.Pick("Present Encoding", "Frame encoding"),
@@ -19999,21 +20086,23 @@ inline void DrawSectionHookPoint(const ui::PanelText& text) {
         text.Pick("Present UI Correction", "Keep the HUD"),
         "Asks the model to leave the game's HUD as it is: at the present, the"
         " frame already carries it.");
-    constexpr const char* kPresentFrameModes[] = {"Every frame", "Game frames"};
-    ChoiceSetting(
-        text, kSetPresentFrames, text.Pick("Present Frames", "Generated frames"),
-        kPresentFrameModes,
-        "With frame generation: Neural Rendering on every presented frame, or"
-        " only on the first one of each game frame (less GPU time, but the"
-        " generated frames are shown without it, which can read as a"
-        " flicker).");
-    constexpr const char* kPresentFgSources[] = {"Auto", "Stable timing", "Legacy timing"};
-    ChoiceSetting(
-        text, kSetPresentFgSource, "Frame generation detection", kPresentFgSources,
-        "Auto uses the game's declared frame generation multiplier when available."
-        " Otherwise it measures a stable cadence, keeping the motion scale through"
-        " hitches. Stable timing ignores declarations. Legacy timing restores the"
-        " earlier detection rule for compatibility.");
+    if (chosen == kHookPresent) {
+      constexpr const char* kPresentFrameModes[] = {"Every frame", "Game frames"};
+      ChoiceSetting(
+          text, kSetPresentFrames, text.Pick("Present Frames", "Generated frames"),
+          kPresentFrameModes,
+          "With frame generation: Neural Rendering on every presented frame, or"
+          " only on the first one of each game frame (less GPU time, but the"
+          " generated frames are shown without it, which can read as a"
+          " flicker).");
+      constexpr const char* kPresentFgSources[] = {"Auto", "Stable timing", "Legacy timing"};
+      ChoiceSetting(
+          text, kSetPresentFgSource, "Frame generation detection", kPresentFgSources,
+          "Auto uses the game's declared frame generation multiplier when available."
+          " Otherwise it measures a stable cadence, keeping the motion scale through"
+          " hitches. Stable timing ignores declarations. Legacy timing restores the"
+          " earlier detection rule for compatibility.");
+    }
   }
 }
 
@@ -22070,6 +22159,7 @@ inline void LoadConfiguration() {
   // nothing and the apply section below persists a fresh default state.
   bool saved_enabled = defaults::kEnabled;
   bool saved_pre_upscale = defaults::kPreSr;
+  bool saved_auto_present_fallback = defaults::kAutoPresentFallback;
   uint32_t saved_present_guides = defaults::kPresentGuides;
   uint32_t saved_present_encoding = defaults::kPresentEncoding;
   float saved_present_white = defaults::kPresentWhiteNits;
@@ -22177,6 +22267,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "NRPresentPreFgContract", saved_present_pre_fg_contract);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRPresentMVecUnits", saved_present_mvec_units);
+  reshade::get_config_value(
+      nullptr, kConfigSection, "NRAutoPresentFallback", saved_auto_present_fallback);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRAutoFgFallback", saved_auto_fg_fallback);
   reshade::get_config_value(
@@ -22736,6 +22828,7 @@ inline void LoadConfiguration() {
   detail_stability = SanitizeEnumKey(
       saved_detail_stability, defaults::kDetailStability, 0u, 2u, "NRDetailStability");
   enabled = saved_enabled;
+  auto_present_fallback = saved_auto_present_fallback;
   hook_point = SanitizeEnumKey(
       saved_hook_point, defaults::kHookPoint, 0u, 2u, "NRHookPoint");
   present_guides = SanitizeEnumKey(
@@ -22951,7 +23044,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     // rebuilds without destroying its swapchain first.
     if (device->get_api() == reshade::api::device_api::d3d11
         && bridge_device_live.load(std::memory_order_acquire)
-        && renodx::utils::directx::NativeIdentity(
+        && renodx::addons::dlss5::native_identity::Get(
                reinterpret_cast<IUnknown*>(device->get_native()))
                == bridge_device11_identity.load(std::memory_order_acquire)) {
       destroy_device_matches.fetch_add(1, std::memory_order_relaxed);
@@ -23125,7 +23218,7 @@ inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) 
       // window's) as the game's, and ignored the game's own whenever
       // anything had presented through D3D12 - leaving a rebuilt device to
       // decline every evaluate as a "second immediate context".
-      if (renodx::utils::directx::NativeIdentity(
+      if (renodx::addons::dlss5::native_identity::Get(
               reinterpret_cast<IUnknown*>(device->get_native()))
           != bridge_device11_identity.load(std::memory_order_acquire)) {
         return;

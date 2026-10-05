@@ -55,7 +55,7 @@
 
 #include <detours.h>
 
-#include "../../utils/vtable.hpp"
+#include "detour_transaction.hpp"
 #include "lastgasp.hpp"
 
 namespace renodx::addons::dlss5::detour_guard {
@@ -153,7 +153,7 @@ inline Head Classify(const Record& record) noexcept {
 // pending transaction) attaches nothing and fails nothing: it is retried.
 inline size_t AttachAll(std::span<const Hook> hooks, size_t* failed) {
   std::lock_guard<std::mutex> transaction(
-      renodx::utils::vtable::TransactionMutex());
+      renodx::addons::dlss5::detour_transaction::TransactionMutex());
   const size_t n = hooks.size();
   std::vector<void*> resolved(n, nullptr);
   size_t remaining = 0;
@@ -165,7 +165,7 @@ inline size_t AttachAll(std::span<const Hook> hooks, size_t* failed) {
   }
   *failed = 0;
   while (remaining != 0) {
-    if (!renodx::utils::vtable::BeginTransaction()) return 0;
+    if (!renodx::addons::dlss5::detour_transaction::BeginTransaction()) return 0;
     DetourUpdateThread(GetCurrentThread());
     bool aborted = false;
     size_t pending = 0;
@@ -283,8 +283,8 @@ inline Removal Detach(const Hook& hook) {
     const Head head = Classify(*hook.record);
     if (head == Head::kOurs) {
       std::lock_guard<std::mutex> transaction(
-          renodx::utils::vtable::TransactionMutex());
-      bool detached = renodx::utils::vtable::BeginTransaction();
+          renodx::addons::dlss5::detour_transaction::TransactionMutex());
+      bool detached = renodx::addons::dlss5::detour_transaction::BeginTransaction();
       if (detached) {
         DetourUpdateThread(GetCurrentThread());
         detached = DetourDetach(hook.real, hook.detour) == NO_ERROR
