@@ -82,7 +82,12 @@ if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target)) {
 
 Push-Location $root
 try {
-  & cmake --preset clang-x64 "-DCMAKE_MODULE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:winhttp.dll"
+  # Full LTO crashes on capture_arena's inline thread_local storage (COFF).
+  # Keep the Release optimizations, omitting only -flto. LLVM issue #203722:
+  # https://github.com/llvm/llvm-project/issues/203722
+  & cmake --preset clang-x64 `
+    "-DCMAKE_MODULE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:winhttp.dll" `
+    "-DCMAKE_CXX_FLAGS_RELEASE=/Ox /Ob2 /DNDEBUG /Ot /GF"
   if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed; check the first error above.' }
   $preset = 'clang-x64-' + $Configuration.ToLowerInvariant()
   & cmake --build --preset $preset --target detours_build
