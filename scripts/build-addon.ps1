@@ -82,7 +82,7 @@ if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target)) {
 
 Push-Location $root
 try {
-  & cmake --preset clang-x64
+  & cmake --preset clang-x64 "-DCMAKE_MODULE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:winhttp.dll"
   if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed; check the first error above.' }
   $preset = 'clang-x64-' + $Configuration.ToLowerInvariant()
   & cmake --build --preset $preset --target detours_build
